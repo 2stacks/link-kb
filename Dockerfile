@@ -1,0 +1,23 @@
+FROM python:3.12-slim
+
+# System deps for sqlite-vec
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc libsqlite3-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN mkdir -p /data
+
+ENV PYTHONUNBUFFERED=1
+ENV PORT=5000
+ENV DB_PATH=/data/link-kb.db
+
+EXPOSE 5000
+
+ENTRYPOINT ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "300", "app:app"]

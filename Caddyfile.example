@@ -1,0 +1,10 @@
+# Add this to your existing Caddyfile on the linkding host
+# to serve link-kb behind the same reverse proxy.
+
+linkkb.2stacks.net {
+    reverse_proxy link-kb:5000
+    encode gzip
+    log {
+        output file /var/log/caddy/link-kb.access.log
+    }
+}

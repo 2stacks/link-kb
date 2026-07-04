@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Link KB — Semantic Search</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --surface: #161b22;
+            --border: #30363d;
+            --text: #c9d1d9;
+            --text-dim: #8b949e;
+            --accent: #58a6ff;
+            --accent-hover: #79b8ff;
+            --tag: #1f6feb22;
+            --tag-text: #58a6ff;
+            --success: #3fb950;
+            --url: #8b949e;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem 1rem;
+        }
+        header {
+            text-align: center;
+            padding: 3rem 0 2rem;
+        }
+        header h1 {
+            font-size: 1.75rem;
+            font-weight: 600;
+            color: var(--text);
+            margin-bottom: 0.5rem;
+        }
+        header p {
+            color: var(--text-dim);
+            font-size: 0.9rem;
+        }
+        .search-box {
+            position: relative;
+            margin: 1.5rem 0;
+        }
+        .search-box input {
+            width: 100%;
+            padding: 0.875rem 1.25rem;
+            font-size: 1rem;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .search-box input:focus {
+            border-color: var(--accent);
+        }
+        .search-box input::placeholder {
+            color: var(--text-dim);
+        }
+        .controls {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+        }
+        .controls button {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: all 0.2s;
+        }
+        .controls button:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+        .controls .status {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+        }
+        .controls .status .count {
+            color: var(--success);
+            font-weight: 600;
+        }
+        #results { list-style: none; }
+        .result-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.25rem;
+            margin-bottom: 0.75rem;
+            transition: border-color 0.2s;
+        }
+        .result-card:hover {
+            border-color: var(--accent);
+        }
+        .result-card a.title {
+            font-size: 1.05rem;
+            font-weight: 600;
+            color: var(--accent);
+            text-decoration: none;
+            display: block;
+            margin-bottom: 0.35rem;
+        }
+        .result-card a.title:hover {
+            color: var(--accent-hover);
+            text-decoration: underline;
+        }
+        .result-card .url {
+            font-size: 0.8rem;
+            color: var(--url);
+            margin-bottom: 0.5rem;
+            word-break: break-all;
+        }
+        .result-card .desc {
+            font-size: 0.875rem;
+            color: var(--text-dim);
+            line-height: 1.5;
+            margin-bottom: 0.5rem;
+        }
+        .result-card .meta {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .result-card .tag {
+            background: var(--tag);
+            color: var(--tag-text);
+            font-size: 0.75rem;
+            padding: 0.15rem 0.5rem;
+            border-radius: 12px;
+        }
+        .result-card .date {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+        }
+        .result-card .score {
+            margin-left: auto;
+            font-size: 0.75rem;
+            color: var(--text-dim);
+        }
+        .empty {
+            text-align: center;
+            padding: 3rem 1rem;
+            color: var(--text-dim);
+        }
+        .empty .icon {
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+        }
+        .loading {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-dim);
+        }
+        .spinner {
+            display: inline-block;
+            width: 24px;
+            height: 24px;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        footer {
+            text-align: center;
+            padding: 2rem 0;
+            color: var(--text-dim);
+            font-size: 0.75rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>&#x1F50D; Link KB</h1>
+            <p>Semantic search over your saved links</p>
+        </header>
+
+        <div class="search-box">
+            <input type="text" id="query" placeholder="Describe what you're looking for..." autofocus>
+        </div>
+
+        <div class="controls">
+            <button id="reindex-btn" onclick="reindex()">&#x1F504; Re-index</button>
+            <span class="status" id="status">Loading status...</span>
+        </div>
+
+        <div id="placeholder" class="empty">
+            <div class="icon">&#x1F50D;</div>
+            <p>Search for links by describing what you need</p>
+            <p style="margin-top: 0.5rem; font-size: 0.85rem;">Try: "tool for monitoring Kubernetes" or "password manager with API"</p>
+        </div>
+
+        <ul id="results"></ul>
+
+        <footer>
+            Powered by nomic-embed &middot; sqlite-vec &middot; Linkding
+        </footer>
+    </div>
+
+    <script>
+        const queryInput = document.getElementById('query');
+        const resultsEl = document.getElementById('results');
+        const placeholder = document.getElementById('placeholder');
+        const statusEl = document.getElementById('status');
+        let debounceTimer;
+
+        // Load status on page load
+        loadStatus();
+
+        // Search on input with debounce
+        queryInput.addEventListener('input', () => {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(doSearch, 400);
+        });
+
+        // Search on Enter
+        queryInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                clearTimeout(debounceTimer);
+                doSearch();
+            }
+        });
+
+        async function loadStatus() {
+            try {
+                const resp = await fetch('/api/status');
+                const data = await resp.json();
+                statusEl.innerHTML = `Indexed: <span class="count">${data.total_indexed}</span> links` +
+                    (data.last_index_time ? ` &middot; last: ${new Date(data.last_index_time).toLocaleDateString()}` : '');
+            } catch (err) {
+                statusEl.textContent = 'Status unavailable';
+            }
+        }
+
+        async function doSearch() {
+            const q = queryInput.value.trim();
+            if (!q) {
+                placeholder.style.display = 'block';
+                resultsEl.innerHTML = '';
+                return;
+            }
+
+            placeholder.style.display = 'none';
+            resultsEl.innerHTML = '<li class="loading"><div class="spinner"></div></li>';
+
+            try {
+                const resp = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=20`);
+                const data = await resp.json();
+
+                if (data.error) {
+                    resultsEl.innerHTML = `<li class="empty"><p>${data.error}</p></li>`;
+                    return;
+                }
+
+                resultsEl.innerHTML = data.results.map(r => `
+                    <li class="result-card">
+                        <a class="title" href="${escapeHtml(r.url)}" target="_blank" rel="noopener">
+                            ${escapeHtml(r.title || r.url)}
+                        </a>
+                        <div class="url">${escapeHtml(r.url)}</div>
+                        ${r.description ? `<div class="desc">${escapeHtml(r.description)}</div>` : ''}
+                        <div class="meta">
+                            ${(r.tags || []).map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('')}
+                            ${r.date_added ? `<span class="date">${new Date(r.date_added).toLocaleDateString()}</span>` : ''}
+                            <span class="score">sim ${(1 - r.score).toFixed(3)}</span>
+                        </div>
+                    </li>
+                `).join('');
+
+                statusEl.innerHTML = `Found ${data.count} results${data.total_indexed ? ` &middot; <span class="count">${data.total_indexed}</span> indexed` : ''}`;
+
+            } catch (err) {
+                resultsEl.innerHTML = `<li class="empty"><p>Search failed: ${err.message}</p></li>`;
+            }
+        }
+
+        async function reindex() {
+            const btn = document.getElementById('reindex-btn');
+            btn.textContent = 'Indexing...';
+            btn.disabled = true;
+            try {
+                const resp = await fetch('/api/index', { method: 'POST' });
+                const data = await resp.json();
+                btn.textContent = `Done (${data.links_indexed} links)`;
+                loadStatus();
+            } catch (err) {
+                btn.textContent = 'Failed';
+            }
+            setTimeout(() => {
+                btn.innerHTML = '&#x1F544; Re-index';
+                btn.disabled = false;
+            }, 3000);
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+    </script>
+</body>
+</html>
