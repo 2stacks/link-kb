@@ -1,6 +1,6 @@
 # link-kb
 
-Semantic knowledge base for your saved bookmarks. Natural language search over Linkding links using `nomic-embed` vector embeddings and `sqlite-vec` ANN search.
+Semantic knowledge base for your saved bookmarks. Natural language search over Linkding links using `nomic-embed` vector embeddings and **ChromaDB** ANN search.
 
 ## What it does
 
@@ -11,7 +11,7 @@ Semantic knowledge base for your saved bookmarks. Natural language search over L
 ## Architecture
 
 ```
-Linkding API ──▶ indexer ──▶ llama-swap (nomic-embed) ──▶ sqlite-vec (vecs)
+Linkding API ──▶ indexer ──▶ llama-swap (nomic-embed) ──▶ ChromaDB
                       ▲
                Flask API + Web UI
 ```
@@ -41,10 +41,10 @@ curl -X POST http://localhost:5000/api/index
 | Variable | Description | Default |
 |---|---|---|
 | `LINKDING_URL` | Linkding base URL | `https://linkding.2stacks.net` |
-| `LINKDING_API_KEY` | Linkding API key | (required) |
+| `LINKDING_API_KEY` | Linkding API token | (required) |
 | `EMBEDDING_URL` | llama-swap base URL | `http://localhost:8080` |
 | `EMBEDDING_MODEL` | Embedding model ID | `nomic-embed-text-v1.5` |
-| `DB_PATH` | SQLite vector DB path | `/data/link-kb.db` |
+| `DB_PATH` | ChromaDB directory | `/data/link-kb` |
 
 ## API
 
@@ -65,7 +65,7 @@ curl -X POST http://localhost:5000/api/index
 ## Stack
 
 - **Flask** — API + web UI
-- **vecs** — Python wrapper for sqlite-vec (ANN search in SQLite)
+- **ChromaDB** — Persistent vector DB (SQLite + HNSW backend)
 - **trafilatura** — Clean page content extraction
 - **nomic-embed-text-v1.5** — 768-dim embeddings via llama-swap
 - **Gunicorn** — Production WSGI server

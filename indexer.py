@@ -1,7 +1,7 @@
 """
 Linkding indexer — fetches bookmarks, embeds content, stores vectors.
 
-Uses trafilatura for page extraction and vecs (sqlite-vec) for
+Uses trafilatura for page extraction and ChromaDB for
 ANN search backed by llama-swap nomic-embed embeddings.
 """
 
@@ -9,8 +9,8 @@ import os
 import time
 import logging
 import requests
+import chromadb
 import trafilatura
-import vecs
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -23,7 +23,7 @@ LINKDING_URL = os.getenv("LINKDING_URL", "https://linkding.2stacks.net")
 LINKDING_API_KEY = os.getenv("LINKDING_API_KEY", "")
 EMBEDDING_URL = os.getenv("EMBEDDING_URL", "http://localhost:8080")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text-v1.5")
-DB_PATH = os.getenv("DB_PATH", "/data/link-kb.db")
+DB_PATH = os.getenv("DB_PATH", "/data/link-kb")  # ChromaDB uses a directory
 EMBED_DIM = 768  # nomic-embed-text-v1.5 dimension
 
 
@@ -39,12 +39,13 @@ class Indexer:
         self._total_indexed = 0
 
     def init_db(self):
-        """Initialize vecs (sqlite-vec) store."""
-        self.vector_store = vecs.VecClient(DB_PATH)
-        # Create or get collection with 768-dim cosine index
+        """Initialize ChromaDB persistent store."""
+        os.makedirs(DB_PATH, exist_ok=True)
+        self.vector_store = chromadb.PersistentClient(path=DB_PATH)
+        # Get or create collection — cosine distance for semantic search
         self.collection = self.vector_store.get_or_create_collection(
-            "links",
-            dimension=EMBED_DIM
+            name="links",
+            metadata={"hnsw:space": "cosine"}
         )
 
     def _embed(self, text: str) -> list:
@@ -86,10 +87,7 @@ class Indexer:
     def _extract_page_content(self, url: str) -> dict:
         """Fetch and extract text content from a URL."""
         try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (compatible; LinkKB/1.0)"
-            }
-            content = trafilatura.fetch_url(url, timeout=15)
+            content = trafilatura.fetch_url(url)
             if not content:
                 return {"title": "", "text": ""}
             text = trafilatura.extract(
@@ -99,19 +97,7 @@ class Indexer:
                 include_links=False,
                 favor_precision=True
             )
-            # Get title from the HTML if possible
-            try:
-                title = trafilatura.extract(
-                    content,
-                    include_comments=False,
-                    include_tables=False,
-                    include_links=False,
-                    favor_recall=False,
-                    _extraction_kwargs={}
-                )
-            except Exception:
-                title = ""
-            return {"title": title or "", "text": text or ""}
+            return {"title": "", "text": text or ""}
         except Exception as e:
             logger.warning(f"Failed to extract content from {url}: {e}")
             return {"title": "", "text": ""}
@@ -123,15 +109,15 @@ class Indexer:
         description = link.get("description", "")
         notes = link.get("notes", "")
         tag_names = link.get("tag_names", [])
-        
+
         # Page content
         page_text = page_content.get("text", "")
-        
+
         # Truncate page text to avoid embedding size limits
         max_content_len = 8000
         if len(page_text) > max_content_len:
             page_text = page_text[:max_content_len]
-        
+
         parts = []
         if title:
             parts.append(f"Title: {title}")
@@ -144,54 +130,56 @@ class Indexer:
         parts.append(f"URL: {url}")
         if page_text:
             parts.append(f"Content: {page_text}")
-        
+
         return "\n".join(parts)
 
     def full_index(self) -> int:
         """Fetch all links from Linkding, embed them, and store."""
         logger.info("Starting full index...")
-        
+
         if not self.vector_store:
             self.init_db()
-        
+
         links = self._fetch_linkding_links()
         logger.info(f"Fetched {len(links)} links from Linkding")
-        
+
         for i, link in enumerate(links):
             url = link.get("url", "")
             if not url:
                 continue
-            
+
             logger.info(f"Processing [{i+1}/{len(links)}]: {url}")
-            
+
             # Extract page content
             page_content = self._extract_page_content(url)
-            
+
             # Build text for embedding
             embed_text = self._build_embedding_text(link, page_content)
-            
+
             # Get embedding
             vector = self._embed(embed_text)
-            
-            # Metadata for search results
+
+            # ChromaDB metadata (values must be str, int, float, or bool)
             metadata = {
                 "url": url,
                 "title": link.get("title", ""),
                 "description": link.get("description", ""),
-                "tags": link.get("tag_names", []),
+                "tags": "|".join(link.get("tag_names", [])),
                 "date_added": link.get("date_added", ""),
                 "date_modified": link.get("date_modified", ""),
             }
-            
-            # Upsert into vecs (uses linkding ID as id)
+
+            # Upsert into ChromaDB
             link_id = f"ld-{link.get('id', i)}"
             self.collection.upsert(
-                rows=[(link_id, vector, metadata)]
+                ids=[link_id],
+                embeddings=[vector],
+                metadatas=[metadata]
             )
-            
+
             # Rate limit to avoid hammering llama-swap
             time.sleep(0.5)
-        
+
         self._last_index_time = datetime.now(timezone.utc).isoformat()
         self._total_indexed = len(links)
         logger.info(f"Index complete: {self._total_indexed} links stored")
@@ -201,30 +189,38 @@ class Indexer:
         """Semantic search: embed query, find nearest neighbors."""
         if not self.vector_store:
             self.init_db()
-        
+
         query_vector = self._embed(query)
-        
-        # ANN search with cosine similarity
+
+        # ChromaDB query — returns dict with ids, distances, metadatas
         results = self.collection.query(
-            data=query_vector,
-            namespace=None,
-            limit=limit,
-            measure="cosine_distance"
+            query_embeddings=[query_vector],
+            n_results=limit
         )
-        
+
         # Format results
         formatted = []
-        for hit in results:
-            metadata = hit.metadata
+        ids = results.get("ids", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+
+        for doc_id, dist, meta in zip(ids, distances, metadatas):
+            if meta is None:
+                continue
+            # Parse pipe-delimited tags back to list
+            tags = meta.get("tags", "").split("|") if meta.get("tags") else []
+            # Cosine distance: 0 = identical, 2 = opposite
+            # Convert to similarity score (1 = perfect, 0 = orthogonal)
+            score = max(0, 1 - (dist / 2)) if dist else 0
             formatted.append({
-                "url": metadata.get("url", ""),
-                "title": metadata.get("title", ""),
-                "description": metadata.get("description", ""),
-                "tags": metadata.get("tags", []),
-                "date_added": metadata.get("date_added", ""),
-                "score": float(hit.score),
+                "url": meta.get("url", ""),
+                "title": meta.get("title", ""),
+                "description": meta.get("description", ""),
+                "tags": tags,
+                "date_added": meta.get("date_added", ""),
+                "score": round(score, 4),
             })
-        
+
         return formatted
 
     def get_status(self) -> dict:
