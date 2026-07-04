@@ -41,8 +41,11 @@ class Indexer:
     def init_db(self):
         """Initialize ChromaDB persistent store."""
         os.makedirs(DB_PATH, exist_ok=True)
+        # Disable ChromaDB telemetry to avoid log spam
+        os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
         self.vector_store = chromadb.PersistentClient(path=DB_PATH)
         # Get or create collection — cosine distance for semantic search
+        # Dimensionality is auto-detected from first upsert (768 or 1024)
         self.collection = self.vector_store.get_or_create_collection(
             name="links",
             metadata={"hnsw:space": "cosine"}
@@ -113,8 +116,9 @@ class Indexer:
         # Page content
         page_text = page_content.get("text", "")
 
-        # Truncate page text to avoid embedding size limits
-        max_content_len = 8000
+        # Truncate page text — nomic-embed on llama-swap has 2048 token limit
+        # Keep total embedding text (metadata + content) well under that
+        max_content_len = 2500
         if len(page_text) > max_content_len:
             page_text = page_text[:max_content_len]
 
