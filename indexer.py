@@ -30,7 +30,7 @@ EMBED_DIM = 768  # nomic-embed-text-v1.5 dimension
 class Indexer:
     def __init__(self):
         self.headers = {
-            "Authorization": f"Apikey {LINKDING_API_KEY}",
+            "Authorization": f"Token {LINKDING_API_KEY}",
             "Accept": "application/json"
         }
         self.embed_url = f"{EMBEDDING_URL}/v1/embeddings"
@@ -67,10 +67,10 @@ class Indexer:
     def _fetch_linkding_links(self) -> list:
         """Fetch all bookmarks from Linkding API."""
         links = []
-        page = 1
-        per_page = 100
+        offset = 0
+        limit = 100
         while True:
-            url = f"{LINKDING_URL}/api/v1/sites/?page={page}&page_size={per_page}"
+            url = f"{LINKDING_URL}/api/bookmarks/?limit={limit}&offset={offset}"
             resp = requests.get(url, headers=self.headers, timeout=30)
             if resp.status_code != 200:
                 logger.error(f"Linkding API error: {resp.status_code} - {resp.text}")
@@ -78,9 +78,9 @@ class Indexer:
             data = resp.json()
             results = data.get("results", [])
             links.extend(results)
-            if not data.get("next"):
+            if offset + len(results) >= data.get("count", 0):
                 break
-            page += 1
+            offset += limit
         return links
 
     def _extract_page_content(self, url: str) -> dict:
@@ -118,11 +118,11 @@ class Indexer:
 
     def _build_embedding_text(self, link: dict, page_content: dict) -> str:
         """Build text to embed from link metadata + page content."""
-        # Linkding fields
         title = link.get("title", "")
         url = link.get("url", "")
         description = link.get("description", "")
-        tags = [tag.get("tag", "") for tag in link.get("tags", [])]
+        notes = link.get("notes", "")
+        tag_names = link.get("tag_names", [])
         
         # Page content
         page_text = page_content.get("text", "")
@@ -137,8 +137,10 @@ class Indexer:
             parts.append(f"Title: {title}")
         if description:
             parts.append(f"Description: {description}")
-        if tags:
-            parts.append(f"Tags: {', '.join(tags)}")
+        if notes:
+            parts.append(f"Notes: {notes}")
+        if tag_names:
+            parts.append(f"Tags: {', '.join(tag_names)}")
         parts.append(f"URL: {url}")
         if page_text:
             parts.append(f"Content: {page_text}")
@@ -176,16 +178,15 @@ class Indexer:
                 "url": url,
                 "title": link.get("title", ""),
                 "description": link.get("description", ""),
-                "tags": [t.get("tag", "") for t in link.get("tags", [])],
+                "tags": link.get("tag_names", []),
                 "date_added": link.get("date_added", ""),
                 "date_modified": link.get("date_modified", ""),
-                "uuid": link.get("uuid", ""),
             }
             
-            # Upsert into vecs (uses UUID as id)
-            link_uuid = link.get("uuid", f"link-{i}")
+            # Upsert into vecs (uses linkding ID as id)
+            link_id = f"ld-{link.get('id', i)}"
             self.collection.upsert(
-                rows=[(link_uuid, vector, metadata)]
+                rows=[(link_id, vector, metadata)]
             )
             
             # Rate limit to avoid hammering llama-swap
