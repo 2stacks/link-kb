@@ -20,4 +20,4 @@ ENV DB_PATH=/data/link-kb
 
 EXPOSE 5000
 
-ENTRYPOINT ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "300", "app:app"]
+ENTRYPOINT ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "300", "--graceful-timeout", "300", "app:app"]
