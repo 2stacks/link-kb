@@ -24,7 +24,8 @@ LINKDING_API_KEY = os.getenv("LINKDING_API_KEY", "")
 EMBEDDING_URL = os.getenv("EMBEDDING_URL", "http://localhost:8080")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text-v1.5")
 DB_PATH = os.getenv("DB_PATH", "/data/link-kb")  # ChromaDB uses a directory
-EMBED_DIM = 768  # nomic-embed-text-v1.5 dimension
+# EMBED_DIM is auto-detected from first embedding response
+EMBED_DIM = None  # will be set on first successful embed
 
 
 class Indexer:
@@ -53,6 +54,7 @@ class Indexer:
 
     def _embed(self, text: str) -> list:
         """Send text to llama-swap embedding endpoint."""
+        global EMBED_DIM
         payload = {
             "model": EMBEDDING_MODEL,
             "input": text
@@ -62,11 +64,17 @@ class Indexer:
             resp = requests.post(self.embed_url, json=payload, timeout=30)
             resp.raise_for_status()
             data = resp.json()
-            return data["data"][0]["embedding"]
+            embedding = data["data"][0]["embedding"]
+            if EMBED_DIM is None:
+                EMBED_DIM = len(embedding)
+                logger.info(f"Detected embedding dim: {EMBED_DIM}")
+            return embedding
         except Exception as e:
             body = resp.text if resp is not None else "no response"
             logger.error(f"Embedding failed: {e} - {body}")
-            return [0.0] * EMBED_DIM  # fallback zero vector
+            # Use detected dim or default to 1024
+            dim = EMBED_DIM or 1024
+            return [0.0] * dim  # fallback zero vector
 
     def _fetch_linkding_links(self) -> list:
         """Fetch all bookmarks from Linkding API."""
