@@ -1,11 +1,12 @@
 """
 link-kb — Semantic knowledge base for your saved links.
 
-Natural language search over Linkding bookmarks using nomic-embed
-vector embeddings and sqlite-vec ANN search.
+Natural language search over Linkding bookmarks using
+vector embeddings and ChromaDB ANN search.
 """
 
 import os
+import threading
 from flask import Flask, request, jsonify, render_template
 from indexer import Indexer
 
@@ -13,6 +14,9 @@ app = Flask(__name__)
 
 # Lazy-init indexer
 indexer = None
+index_lock = threading.Lock()
+_indexing = False
+_index_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
 
 
 def get_indexer():
@@ -23,8 +27,26 @@ def get_indexer():
     return indexer
 
 
+def _run_index():
+    """Run full index in background thread."""
+    global _indexing
+    try:
+        ix = get_indexer()
+        total = ix.full_index()
+        with index_lock:
+            _index_progress["total"] = total
+            _index_progress["processed"] = total
+            _index_progress["done"] = True
+    except Exception as e:
+        with index_lock:
+            _index_progress["done"] = True
+            _index_progress["error"] = str(e)
+    finally:
+        _indexing = False
+
+
 @app.route("/")
-def index():
+def index_page():
     """Serve the search UI."""
     return render_template("index.html")
 
@@ -33,20 +55,20 @@ def index():
 def search():
     """
     Semantic search endpoint.
-    
+
     Query params:
       q: Natural language query string
       limit: Max results (default 10)
     """
     query = request.args.get("q", "").strip()
     limit = int(request.args.get("limit", 10))
-    
+
     if not query:
         return jsonify({"error": "Missing query parameter 'q'"}), 400
-    
+
     ix = get_indexer()
     results = ix.search(query, limit=limit)
-    
+
     return jsonify({
         "query": query,
         "count": len(results),
@@ -56,12 +78,21 @@ def search():
 
 @app.route("/api/index", methods=["POST"])
 def trigger_index():
-    """Manually trigger a full re-index."""
-    ix = get_indexer()
-    total = ix.full_index()
+    """Start a full re-index in the background."""
+    global _indexing
+    with index_lock:
+        if _indexing:
+            return jsonify({
+                "status": "already_running",
+                "progress": _index_progress
+            }), 409
+        _indexing = True
+        _index_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
+    t = threading.Thread(target=_run_index, daemon=True)
+    t.start()
     return jsonify({
-        "status": "completed",
-        "links_indexed": total
+        "status": "started",
+        "message": "Indexing in background. Check /api/status for progress."
     })
 
 
@@ -69,7 +100,12 @@ def trigger_index():
 def status():
     """Indexing status and stats."""
     ix = get_indexer()
-    return jsonify(ix.get_status())
+    with index_lock:
+        progress = dict(_index_progress)
+    base = ix.get_status()
+    base["indexing"] = _indexing
+    base["progress"] = progress
+    return jsonify(base)
 
 
 if __name__ == "__main__":
