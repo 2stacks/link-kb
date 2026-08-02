@@ -2,7 +2,16 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+venv/
 *.env
 *.db
 instance/
 .DS_Store
+
+# Test artifacts
+test_chroma/
+test_*.py
+find_*.py
+
+llama-swap-tfour.yaml
+llama-swap.service

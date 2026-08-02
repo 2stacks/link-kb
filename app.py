@@ -7,6 +7,7 @@ vector embeddings and ChromaDB ANN search.
 
 import os
 import threading
+from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 from indexer import Indexer
 
@@ -32,10 +33,17 @@ def _run_index():
     global _indexing
     try:
         ix = get_indexer()
-        total = ix.full_index()
+        def on_progress(i, total, url):
+            with index_lock:
+                _index_progress["processed"] = i
+                _index_progress["total"] = total
+                _index_progress["started_at"] = _index_progress.get("started_at") or datetime.now().isoformat()
+                _index_progress["current_url"] = url
+        total = ix.full_index(progress_callback=on_progress)
         with index_lock:
             _index_progress["total"] = total
             _index_progress["processed"] = total
+            _index_progress["started_at"] = _index_progress.get("started_at") or datetime.now().isoformat()
             _index_progress["done"] = True
     except Exception as e:
         with index_lock:

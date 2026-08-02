@@ -3,9 +3,16 @@ Linkding indexer — fetches bookmarks, embeds content, stores vectors.
 
 Uses trafilatura for page extraction and ChromaDB for
 ANN search backed by llama-swap nomic-embed embeddings.
+
+Search strategy:
+  1. Query augmentation — wraps user query in a retrieval prompt template
+     so the embedding model produces a better query vector.
+  2. Keyword boost — for short queries (≤3 words), literally matches
+     terms against title/tags/description and boosts those results.
 """
 
 import os
+import re
 import time
 import logging
 import requests
@@ -24,8 +31,15 @@ LINKDING_API_KEY = os.getenv("LINKDING_API_KEY", "")
 EMBEDDING_URL = os.getenv("EMBEDDING_URL", "http://localhost:8080")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text-v1.5")
 DB_PATH = os.getenv("DB_PATH", "/data/link-kb")  # ChromaDB uses a directory
-# EMBED_DIM is auto-detected from first embedding response
-EMBED_DIM = None  # will be set on first successful embed
+EMBED_DIM = None  # auto-detected from first embedding response
+
+# Truncation limit — T4 nomic-embed has a 2048 token physical batch (-ub 2048).
+# 2048 tokens ≈ 8000 chars. Leave headroom for title/tags/description (~200 chars).
+MAX_CONTENT_LEN = 7000
+
+# Query augmentation template — tells the embedding model to produce a
+# retrieval-oriented vector rather than a definition/description vector.
+QUERY_TEMPLATE = "Find bookmarks about: {query}"
 
 
 class Indexer:
@@ -42,18 +56,76 @@ class Indexer:
     def init_db(self):
         """Initialize ChromaDB persistent store."""
         os.makedirs(DB_PATH, exist_ok=True)
-        # Disable ChromaDB telemetry to avoid log spam
         os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
         self.vector_store = chromadb.PersistentClient(path=DB_PATH)
-        # Get or create collection — cosine distance for semantic search
-        # Dimensionality is auto-detected from first upsert (768 or 1024)
+        # Always re-fetch the collection reference in case it was recreated
         self.collection = self.vector_store.get_or_create_collection(
             name="links",
             metadata={"hnsw:space": "cosine"}
         )
 
+    def _ensure_collection(self):
+        """Re-acquire collection reference if stale."""
+        if not self.vector_store:
+            self.init_db()
+        else:
+            try:
+                self.collection = self.vector_store.get_collection("links")
+            except Exception:
+                self.collection = self.vector_store.get_or_create_collection(
+                    name="links",
+                    metadata={"hnsw:space": "cosine"}
+                )
+
+    def get_status(self) -> dict:
+        """Return indexing status and stats."""
+        count = 0
+        self._ensure_collection()
+        try:
+            count = self.collection.count()
+        except Exception:
+            count = 0
+        return {
+            "total_indexed": count,
+            "last_index_time": self._last_index_time,
+            "linkding_url": LINKDING_URL,
+            "embedding_model": EMBEDDING_MODEL,
+            "db_path": DB_PATH,
+            "embedding_dim": EMBED_DIM,
+        }
+
     def _embed(self, text: str) -> list:
-        """Send text to llama-swap embedding endpoint."""
+        """Send text to llama-swap embedding endpoint.
+
+        Chunks text to stay under the T4's 512 token physical batch limit.
+        Returns the mean of chunk embeddings for long text.
+        """
+        global EMBED_DIM
+        # Rough token estimate: 1 token ≈ 4 chars for English text
+        # T4 nomic-embed has a 512 token physical batch limit
+        est_tokens = len(text) // 4
+        if est_tokens > 400:
+            # Chunk into ~400 token pieces and average
+            chunks = self._chunk_text(text)
+            chunk_embs = []
+            for chunk in chunks:
+                emb = self._single_embed(chunk)
+                if len(emb) and any(v != 0.0 for v in emb):
+                    chunk_embs.append(emb)
+            if chunk_embs:
+                # Mean pooling across chunks
+                dim = len(chunk_embs[0])
+                mean_emb = [sum(e[i] for e in chunk_embs) / len(chunk_embs) for i in range(dim)]
+                # Normalize
+                norm = (sum(v*v for v in mean_emb) ** 0.5) or 1.0
+                mean_emb = [v / norm for v in mean_emb]
+                return mean_emb
+            return [0.0] * (EMBED_DIM or 768)
+
+        return self._single_embed(text)
+
+    def _single_embed(self, text: str) -> list:
+        """Embed a single text chunk, returning zero vector on failure."""
         global EMBED_DIM
         payload = {
             "model": EMBEDDING_MODEL,
@@ -72,9 +144,15 @@ class Indexer:
         except Exception as e:
             body = resp.text if resp is not None else "no response"
             logger.error(f"Embedding failed: {e} - {body}")
-            # Use detected dim or default to 1024
-            dim = EMBED_DIM or 1024
-            return [0.0] * dim  # fallback zero vector
+            dim = EMBED_DIM or 768
+            return [0.0] * dim
+
+    def _chunk_text(self, text: str, max_chars: int = 800) -> list:
+        """Split text into chunks that fit within token limits."""
+        chunks = []
+        for i in range(0, len(text), max_chars):
+            chunks.append(text[i:i+max_chars])
+        return chunks
 
     def _fetch_linkding_links(self) -> list:
         """Fetch all bookmarks from Linkding API."""
@@ -121,14 +199,11 @@ class Indexer:
         notes = link.get("notes", "")
         tag_names = link.get("tag_names", [])
 
-        # Page content
         page_text = page_content.get("text", "")
 
-        # Truncate page text — nomic-embed on llama-swap has 2048 token limit
-        # Keep total embedding text (metadata + content) well under that
-        max_content_len = 2500
-        if len(page_text) > max_content_len:
-            page_text = page_text[:max_content_len]
+        # Truncate page text to fit within model context window
+        if len(page_text) > MAX_CONTENT_LEN:
+            page_text = page_text[:MAX_CONTENT_LEN]
 
         parts = []
         if title:
@@ -145,8 +220,12 @@ class Indexer:
 
         return "\n".join(parts)
 
-    def full_index(self) -> int:
-        """Fetch all links from Linkding, embed them, and store."""
+    def full_index(self, progress_callback=None) -> int:
+        """Fetch all links from Linkding, embed them, and store.
+
+        Args:
+            progress_callback: Optional callable(i, total, url) called after each link.
+        """
         logger.info("Starting full index...")
 
         if not self.vector_store:
@@ -162,6 +241,13 @@ class Indexer:
 
             logger.info(f"Processing [{i+1}/{len(links)}]: {url}")
 
+            # Progress callback for real-time status
+            if progress_callback:
+                try:
+                    progress_callback(i + 1, len(links), url)
+                except Exception:
+                    pass
+
             # Extract page content
             page_content = self._extract_page_content(url)
 
@@ -171,7 +257,7 @@ class Indexer:
             # Get embedding
             vector = self._embed(embed_text)
 
-            # ChromaDB metadata (values must be str, int, float, or bool)
+            # ChromaDB metadata
             metadata = {
                 "url": url,
                 "title": link.get("title", ""),
@@ -181,33 +267,74 @@ class Indexer:
                 "date_modified": link.get("date_modified", ""),
             }
 
-            # Upsert into ChromaDB
+            # Store the embedded text as the document for debugging
             link_id = f"ld-{link.get('id', i)}"
             self.collection.upsert(
                 ids=[link_id],
                 embeddings=[vector],
-                metadatas=[metadata]
+                metadatas=[metadata],
+                documents=[embed_text]
             )
 
-            # Rate limit to avoid hammering llama-swap
-            time.sleep(0.5)
+            # Small throttle to avoid overwhelming T4 llama-server
+            time.sleep(0.1)
 
         self._last_index_time = datetime.now(timezone.utc).isoformat()
         self._total_indexed = len(links)
         logger.info(f"Index complete: {self._total_indexed} links stored")
         return self._total_indexed
 
+    def _keyword_boost(self, query: str, results: list) -> list:
+        """
+        Boost results that literally contain the query terms in title/tags/description.
+        Only applies to short queries (≤3 words) where keyword matching is more useful.
+        """
+        query_words = re.split(r'\s+', query.lower().strip())
+
+        # Don't boost for natural language queries (>3 words)
+        if len(query_words) > 3:
+            return results
+
+        # Don't boost for empty or single-char queries
+        if not query_words or all(len(w) <= 1 for w in query_words):
+            return results
+
+        def keyword_score(item: dict) -> float:
+            """Return a boost factor based on how many query terms appear in metadata."""
+            searchable = (
+                item.get("title", "").lower() + " " +
+                item.get("description", "").lower() + " " +
+                " ".join(item.get("tags", [])).lower() + " " +
+                item.get("url", "").lower()
+            )
+            matches = sum(1 for w in query_words if w in searchable)
+            # Boost: 0.1 per matching word (max 0.3 for 3 words)
+            return matches * 0.1
+
+        # Apply boost to scores
+        boosted = []
+        for item in results:
+            item["score"] = min(1.0, item["score"] + keyword_score(item))
+            boosted.append(item)
+
+        # Re-sort by boosted score
+        boosted.sort(key=lambda x: x["score"], reverse=True)
+        return boosted
+
     def search(self, query: str, limit: int = 10) -> list:
-        """Semantic search: embed query, find nearest neighbors."""
+        """Semantic search with query augmentation + keyword boost."""
         if not self.vector_store:
             self.init_db()
 
-        query_vector = self._embed(query)
+        # Query augmentation — wrap in retrieval prompt
+        augmented_query = QUERY_TEMPLATE.format(query=query)
+        query_vector = self._embed(augmented_query)
 
-        # ChromaDB query — returns dict with ids, distances, metadatas
+        # ChromaDB query — fetch a bit more than needed for keyword boosting
+        fetch_limit = min(limit * 3, 50)
         results = self.collection.query(
             query_embeddings=[query_vector],
-            n_results=limit
+            n_results=fetch_limit
         )
 
         # Format results
@@ -219,10 +346,8 @@ class Indexer:
         for doc_id, dist, meta in zip(ids, distances, metadatas):
             if meta is None:
                 continue
-            # Parse pipe-delimited tags back to list
             tags = meta.get("tags", "").split("|") if meta.get("tags") else []
-            # Cosine distance: 0 = identical, 2 = opposite
-            # Convert to similarity score (1 = perfect, 0 = orthogonal)
+            # Cosine distance → similarity score
             score = max(0, 1 - (dist / 2)) if dist else 0
             formatted.append({
                 "url": meta.get("url", ""),
@@ -233,17 +358,10 @@ class Indexer:
                 "score": round(score, 4),
             })
 
-        return formatted
+        # Apply keyword boost for short queries
+        formatted = self._keyword_boost(query, formatted)
 
-    def get_status(self) -> dict:
-        """Return indexing status and stats."""
-        count = 0
-        if self.vector_store:
-            count = self.collection.count()
-        return {
-            "total_indexed": count,
-            "last_index_time": self._last_index_time,
-            "linkding_url": LINKDING_URL,
-            "embedding_model": EMBEDDING_MODEL,
-            "db_path": DB_PATH,
-        }
+        # Trim to requested limit
+        return formatted[:limit]
+
+  
