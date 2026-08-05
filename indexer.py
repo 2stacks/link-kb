@@ -85,11 +85,11 @@ class Indexer:
     def get_status(self) -> dict:
         """Return indexing status and stats."""
         count = 0
-        self._ensure_collection()
-        try:
-            count = self.collection.count()
-        except Exception:
-            count = 0
+        if self.vector_store:
+            try:
+                count = self.meta_collection.count()
+            except Exception:
+                pass
         return {
             "total_indexed": count,
             "last_index_time": self._last_index_time,
