@@ -15,3 +15,6 @@ find_*.py
 
 llama-swap-tfour.yaml
 llama-swap.service
+
+# Planning docs (local notes)
+PLAN-*.md

@@ -54,15 +54,20 @@ class Indexer:
         self._total_indexed = 0
 
     def init_db(self):
-        """Initialize ChromaDB persistent store."""
+        """Initialize ChromaDB persistent store with two collections."""
         os.makedirs(DB_PATH, exist_ok=True)
         os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
         self.vector_store = chromadb.PersistentClient(path=DB_PATH)
-        # Always re-fetch the collection reference in case it was recreated
-        self.collection = self.vector_store.get_or_create_collection(
-            name="links",
+        self.meta_collection = self.vector_store.get_or_create_collection(
+            name="links_meta",
             metadata={"hnsw:space": "cosine"}
         )
+        self.content_collection = self.vector_store.get_or_create_collection(
+            name="links_content",
+            metadata={"hnsw:space": "cosine"}
+        )
+        # Keep `self.collection` as alias for backward compat (points to meta)
+        self.collection = self.meta_collection
 
     def _ensure_collection(self):
         """Re-acquire collection reference if stale."""
@@ -192,18 +197,11 @@ class Indexer:
             return {"title": "", "text": ""}
 
     def _build_embedding_text(self, link: dict, page_content: dict) -> str:
-        """Build text to embed from link metadata + page content."""
+        """Build metadata text to embed from link title/tags/description/notes."""
         title = link.get("title", "")
-        url = link.get("url", "")
         description = link.get("description", "")
         notes = link.get("notes", "")
         tag_names = link.get("tag_names", [])
-
-        page_text = page_content.get("text", "")
-
-        # Truncate page text to fit within model context window
-        if len(page_text) > MAX_CONTENT_LEN:
-            page_text = page_text[:MAX_CONTENT_LEN]
 
         parts = []
         if title:
@@ -214,11 +212,25 @@ class Indexer:
             parts.append(f"Notes: {notes}")
         if tag_names:
             parts.append(f"Tags: {', '.join(tag_names)}")
-        parts.append(f"URL: {url}")
+
+        return "\n".join(parts)
+
+    def _build_content_text(self, link: dict, page_content: dict) -> str:
+        """Build page content text to embed separately."""
+        page_text = page_content.get("text", "")
+        url = link.get("url", "")
+
+        parts = []
+        if url:
+            parts.append(f"URL: {url}")
         if page_text:
             parts.append(f"Content: {page_text}")
 
-        return "\n".join(parts)
+        result = "\n".join(parts)
+        # Truncate to fit within model context window
+        if len(result) > MAX_CONTENT_LEN + 200:
+            result = result[:MAX_CONTENT_LEN + 200]
+        return result
 
     def full_index(self, progress_callback=None) -> int:
         """Fetch all links from Linkding, embed them, and store.
@@ -251,11 +263,13 @@ class Indexer:
             # Extract page content
             page_content = self._extract_page_content(url)
 
-            # Build text for embedding
-            embed_text = self._build_embedding_text(link, page_content)
+            # Build separate text for metadata and content embeddings
+            meta_text = self._build_embedding_text(link, page_content)
+            content_text = self._build_content_text(link, page_content)
 
-            # Get embedding
-            vector = self._embed(embed_text)
+            # Get embeddings
+            meta_vector = self._embed(meta_text)
+            content_vector = self._embed(content_text)
 
             # ChromaDB metadata
             metadata = {
@@ -267,13 +281,19 @@ class Indexer:
                 "date_modified": link.get("date_modified", ""),
             }
 
-            # Store the embedded text as the document for debugging
+            # Store in both collections
             link_id = f"ld-{link.get('id', i)}"
-            self.collection.upsert(
+            self.meta_collection.upsert(
                 ids=[link_id],
-                embeddings=[vector],
+                embeddings=[meta_vector],
                 metadatas=[metadata],
-                documents=[embed_text]
+                documents=[meta_text]
+            )
+            self.content_collection.upsert(
+                ids=[link_id],
+                embeddings=[content_vector],
+                metadatas=[metadata],
+                documents=[content_text]
             )
 
             # Small throttle to avoid overwhelming T4 llama-server
@@ -322,7 +342,7 @@ class Indexer:
         return boosted
 
     def search(self, query: str, limit: int = 10) -> list:
-        """Semantic search with query augmentation + keyword boost."""
+        """Two-vector semantic search: query metadata and content collections, merge by best score."""
         if not self.vector_store:
             self.init_db()
 
@@ -330,33 +350,47 @@ class Indexer:
         augmented_query = QUERY_TEMPLATE.format(query=query)
         query_vector = self._embed(augmented_query)
 
-        # ChromaDB query — fetch a bit more than needed for keyword boosting
-        fetch_limit = min(limit * 3, 50)
-        results = self.collection.query(
+        # Fetch more than needed from each collection for merging
+        fetch_limit = min(limit * 2, 40)
+
+        # Query metadata collection
+        meta_results = self.meta_collection.query(
             query_embeddings=[query_vector],
             n_results=fetch_limit
         )
 
-        # Format results
-        formatted = []
-        ids = results.get("ids", [[]])[0]
-        distances = results.get("distances", [[]])[0]
-        metadatas = results.get("metadatas", [[]])[0]
+        # Query content collection
+        content_results = self.content_collection.query(
+            query_embeddings=[query_vector],
+            n_results=fetch_limit
+        )
 
-        for doc_id, dist, meta in zip(ids, distances, metadatas):
-            if meta is None:
-                continue
-            tags = meta.get("tags", "").split("|") if meta.get("tags") else []
-            # Cosine distance → similarity score
-            score = max(0, 1 - (dist / 2)) if dist else 0
-            formatted.append({
-                "url": meta.get("url", ""),
-                "title": meta.get("title", ""),
-                "description": meta.get("description", ""),
-                "tags": tags,
-                "date_added": meta.get("date_added", ""),
-                "score": round(score, 4),
-            })
+        # Merge results — keyed by link ID, keep best score
+        merged = {}  # link_id -> {score, metadata}
+
+        for src, results in [("meta", meta_results), ("content", content_results)]:
+            ids = results.get("ids", [[]])[0]
+            distances = results.get("distances", [[]])[0]
+            metadatas = results.get("metadatas", [[]])[0]
+
+            for doc_id, dist, meta in zip(ids, distances, metadatas):
+                if meta is None:
+                    continue
+                # Cosine distance → similarity score
+                score = max(0, 1 - (dist / 2)) if dist else 0
+
+                if doc_id not in merged or score > merged[doc_id]["score"]:
+                    merged[doc_id] = {
+                        "url": meta.get("url", ""),
+                        "title": meta.get("title", ""),
+                        "description": meta.get("description", ""),
+                        "tags": meta.get("tags", "").split("|") if meta.get("tags") else [],
+                        "date_added": meta.get("date_added", ""),
+                        "score": score,
+                    }
+
+        # Format and sort by best score
+        formatted = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
 
         # Apply keyword boost for short queries
         formatted = self._keyword_boost(query, formatted)

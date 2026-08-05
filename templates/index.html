@@ -44,6 +44,11 @@
             color: var(--text-dim);
             font-size: 0.9rem;
         }
+        header p.sub {
+            margin-top: 0.35rem;
+            font-size: 0.8rem;
+            color: var(--text-dim);
+        }
         .search-box {
             position: relative;
             margin: 1.5rem 0;
@@ -188,6 +193,7 @@
         <header>
             <h1>&#x1F50D; Link KB</h1>
             <p>Semantic search over your saved links</p>
+            <p class="sub">Score: cosine similarity (0 = unrelated, 1.0 = identical meaning)</p>
         </header>
 
         <div class="search-box">
@@ -277,7 +283,7 @@
                         <div class="meta">
                             ${(r.tags || []).map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('')}
                             ${r.date_added ? `<span class="date">${new Date(r.date_added).toLocaleDateString()}</span>` : ''}
-                            <span class="score">sim ${(1 - r.score).toFixed(3)}</span>
+                            <span class="score">sim ${r.score.toFixed(2)}</span>
                         </div>
                     </li>
                 `).join('');
