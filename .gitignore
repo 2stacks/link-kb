@@ -9,12 +9,12 @@ instance/
 .DS_Store
 
 # Test artifacts
-test_chroma/
 test_*.py
 find_*.py
 
-llama-swap-tfour.yaml
-llama-swap.service
-
 # Planning docs (local notes)
 PLAN-*.md
+
+# T4 host config
+llama-swap-tfour.yaml
+llama-swap.service

@@ -10,7 +10,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY app/ ./app/
+COPY templates/ ./templates/
 
 RUN mkdir -p /data
 
@@ -20,4 +21,4 @@ ENV DB_PATH=/data/link-kb
 
 EXPOSE 5000
 
-ENTRYPOINT ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "300", "--graceful-timeout", "300", "app:app"]
+ENTRYPOINT ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "300", "--graceful-timeout", "300", "app.server:app"]

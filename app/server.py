@@ -1,15 +1,11 @@
-"""
-link-kb — Semantic knowledge base for your saved links.
-
-Natural language search over Linkding bookmarks using
-vector embeddings and ChromaDB ANN search.
-"""
+"""Flask server — routes and background indexing."""
 
 import os
 import threading
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
-from indexer import Indexer
+
+from .indexer import Indexer
 
 app = Flask(__name__)
 

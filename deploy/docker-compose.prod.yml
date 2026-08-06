@@ -1,12 +1,16 @@
+# Production deployment example
+# Place behind a reverse proxy (Caddy, nginx, etc.) on port 80/443.
+# Adjust the embedding URL to match your production embedding service.
+
 services:
   link-kb:
-    build: .
-    container_name: link-kb
-    restart: unless-stopped
-    ports:
-      - "0.0.0.0:5000:5000"
+    build: ..
+    restart: always
+    # Do NOT expose port publicly — put behind a reverse proxy
+    expose:
+      - "5000"
     env_file:
-      - .env
+      - ../.env
     volumes:
       - link-kb-data:/data
     extra_hosts:
