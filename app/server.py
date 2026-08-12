@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify, render_template
 
 from .indexer import Indexer
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder="../templates")
 
 # Lazy-init indexer
 indexer = None
