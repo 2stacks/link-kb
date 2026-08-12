@@ -16,6 +16,7 @@ COPY templates/ ./templates/
 RUN mkdir -p /data
 
 ENV PYTHONUNBUFFERED=1
+ENV ANONYMIZED_TELEMETRY=False
 ENV PORT=5000
 ENV DB_PATH=/data/link-kb
 
