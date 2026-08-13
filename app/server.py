@@ -2,12 +2,16 @@
 
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from .indexer import Indexer
 
 app = Flask(__name__, template_folder="../templates")
+
+# Background scheduler for periodic indexing
+scheduler = BackgroundScheduler(daemon=True)
 
 # Lazy-init indexer
 indexer = None
@@ -116,3 +120,30 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     app.run(host="0.0.0.0", port=port, debug=debug)
+
+
+# --- Scheduled indexing (runs under gunicorn too) ---
+def _schedule_index():
+    """Start indexer on schedule."""
+    global _indexing
+    with index_lock:
+        if _indexing:
+            return
+        _indexing = True
+        _index_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
+    t = threading.Thread(target=_run_index, daemon=True)
+    t.start()
+
+# Read interval from env (hours), default 24
+_index_interval = int(os.getenv("INDEX_INTERVAL_HOURS", "24"))
+
+scheduler.add_job(
+    _schedule_index,
+    trigger="interval",
+    hours=_index_interval,
+    max_instances=1,
+    coalesce=True,
+)
+# Also run immediately on startup (delayed so DB is ready)
+scheduler.add_job(_schedule_index, trigger="date", run_date=datetime.now() + timedelta(seconds=5))
+scheduler.start()
