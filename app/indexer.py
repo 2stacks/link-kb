@@ -52,6 +52,11 @@ class Indexer:
         self.vector_store = None
         self._last_index_time = None
         self._total_indexed = 0
+        # Persistent session with connection pooling to avoid CLOSE-WAIT buildup on llama-swap
+        self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_maxsize=4, pool_connections=4)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
 
     def init_db(self):
         """Initialize ChromaDB persistent store with two collections."""
@@ -138,7 +143,7 @@ class Indexer:
         }
         resp = None
         try:
-            resp = requests.post(self.embed_url, json=payload, timeout=30)
+            resp = self._session.post(self.embed_url, json=payload, timeout=30)
             resp.raise_for_status()
             data = resp.json()
             embedding = data["data"][0]["embedding"]
@@ -166,7 +171,7 @@ class Indexer:
         limit = 100
         while True:
             url = f"{LINKDING_URL}/api/bookmarks/?limit={limit}&offset={offset}"
-            resp = requests.get(url, headers=self.headers, timeout=30)
+            resp = self._session.get(url, headers=self.headers, timeout=30)
             if resp.status_code != 200:
                 logger.error(f"Linkding API error: {resp.status_code} - {resp.text}")
                 break
