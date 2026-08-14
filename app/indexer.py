@@ -41,7 +41,7 @@ MAX_CONTENT_LEN = 7000
 # Query augmentation template — tells the embedding model to produce a
 # retrieval-oriented vector rather than a definition/description vector.
 QUERY_TEMPLATE = "Find bookmarks about: {query}"
-EMBEDDING_TIMEOUT = int(os.getenv("EMBEDDING_TIMEOUT", "120"))
+EMBEDDING_TIMEOUT = int(os.getenv("EMBEDDING_TIMEOUT", "30"))
 
 
 class Indexer:
@@ -57,7 +57,7 @@ class Indexer:
         # Persistent session with connection pooling to avoid CLOSE-WAIT buildup on llama-swap.
         # Retries on read-timeout handle stale pooled connections (T4 server closes idle sockets).
         self._session = requests.Session()
-        retry = urllib3.util.Retry(total=3, read=2, backoff_factor=0.1)
+        retry = urllib3.util.Retry(total=5, read=4, backoff_factor=0.1)
         adapter = requests.adapters.HTTPAdapter(pool_maxsize=4, pool_connections=4, max_retries=retry)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
