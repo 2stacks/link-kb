@@ -40,6 +40,7 @@ MAX_CONTENT_LEN = 7000
 # Query augmentation template — tells the embedding model to produce a
 # retrieval-oriented vector rather than a definition/description vector.
 QUERY_TEMPLATE = "Find bookmarks about: {query}"
+EMBEDDING_TIMEOUT = int(os.getenv("EMBEDDING_TIMEOUT", "120"))
 
 
 class Indexer:
@@ -143,7 +144,7 @@ class Indexer:
         }
         resp = None
         try:
-            resp = self._session.post(self.embed_url, json=payload, timeout=30)
+            resp = self._session.post(self.embed_url, json=payload, timeout=EMBEDDING_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
             embedding = data["data"][0]["embedding"]
