@@ -240,6 +240,8 @@ class Indexer:
     def full_index(self, progress_callback=None) -> int:
         """Fetch all links from Linkding, embed them, and store.
 
+        Removes entries for links no longer present in Linkding.
+
         Args:
             progress_callback: Optional callable(i, total, url) called after each link.
         """
@@ -250,6 +252,18 @@ class Indexer:
 
         links = self._fetch_linkding_links()
         logger.info(f"Fetched {len(links)} links from Linkding")
+
+        # Determine which IDs should exist in the index
+        expected_ids = {f"ld-{link.get('id')}" for link in links}
+
+        # Remove stale entries (deleted in Linkding)
+        for col_name, col in [("links_meta", self.meta_collection),
+                              ("links_content", self.content_collection)]:
+            all_ids = col.get(["ids"])["ids"]
+            stale = [did for did in all_ids if did not in expected_ids]
+            if stale:
+                col.delete(ids=stale)
+                logger.info(f"Removed {len(stale)} stale entries from {col_name}")
 
         for i, link in enumerate(links):
             url = link.get("url", "")
