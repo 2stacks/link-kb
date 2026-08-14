@@ -16,6 +16,7 @@ import re
 import time
 import logging
 import requests
+import urllib3
 import chromadb
 import trafilatura
 from datetime import datetime, timezone
@@ -53,9 +54,11 @@ class Indexer:
         self.vector_store = None
         self._last_index_time = None
         self._total_indexed = 0
-        # Persistent session with connection pooling to avoid CLOSE-WAIT buildup on llama-swap
+        # Persistent session with connection pooling to avoid CLOSE-WAIT buildup on llama-swap.
+        # Retries on read-timeout handle stale pooled connections (T4 server closes idle sockets).
         self._session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_maxsize=4, pool_connections=4)
+        retry = urllib3.util.Retry(total=3, read=2, backoff_factor=0.1)
+        adapter = requests.adapters.HTTPAdapter(pool_maxsize=4, pool_connections=4, max_retries=retry)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
 
