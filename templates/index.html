@@ -93,10 +93,36 @@
         .controls .status {
             font-size: 0.8rem;
             color: var(--text-dim);
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+            flex: 1;
+            max-width: 500px;
         }
         .controls .status .count {
             color: var(--success);
             font-weight: 600;
+        }
+        .controls .status .current-url {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            font-style: italic;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .progress-bar {
+            height: 4px;
+            background: var(--border);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            background: var(--accent);
+            border-radius: 2px;
+            transition: width 0.3s ease;
+            width: 0%;
         }
         #results { list-style: none; }
         .result-card {
@@ -203,6 +229,9 @@
         <div class="controls">
             <button id="reindex-btn" onclick="reindex()">&#x1F504; Re-index</button>
             <span class="status" id="status">Loading status...</span>
+            <div class="progress-bar" id="progress-bar" style="display:none;">
+                <div class="progress-bar-fill" id="progress-fill"></div>
+            </div>
         </div>
 
         <div id="placeholder" class="empty">
@@ -223,9 +252,13 @@
         const resultsEl = document.getElementById('results');
         const placeholder = document.getElementById('placeholder');
         const statusEl = document.getElementById('status');
+        const progressBar = document.getElementById('progress-bar');
+        const progressFill = document.getElementById('progress-fill');
+        const reindexBtn = document.getElementById('reindex-btn');
         let debounceTimer;
+        let pollingTimer = null;
 
-        // Load status on page load
+        // Load status on page load; start polling if an index job is already running
         loadStatus();
 
         // Search on input with debounce
@@ -242,12 +275,67 @@
             }
         });
 
+        function stopPolling() {
+            if (pollingTimer) {
+                clearInterval(pollingTimer);
+                pollingTimer = null;
+            }
+        }
+
+        function startPolling() {
+            stopPolling();
+            loadStatus();
+            pollingTimer = setInterval(loadStatus, 2000);
+        }
+
         async function loadStatus() {
             try {
                 const resp = await fetch('/api/status');
                 const data = await resp.json();
-                statusEl.innerHTML = `Indexed: <span class="count">${data.total_indexed}</span> links` +
-                    (data.last_index_time ? ` &middot; last: ${new Date(data.last_index_time).toLocaleDateString()}` : '');
+                const progress = data.progress || {};
+
+                if (data.indexing && !progress.done) {
+                    // Indexing in progress — show progress bar
+                    const processed = progress.processed || 0;
+                    const total = progress.total || 0;
+                    const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
+
+                    statusEl.innerHTML = `Indexing: <span class="count">${processed}/${total}</span> links (${pct}%)` +
+                        (progress.current_url ? `<div class="current-url">… ${escapeHtml(progress.current_url)}</div>` : '');
+
+                    progressBar.style.display = 'block';
+                    progressFill.style.width = pct + '%';
+
+                    // Keep polling
+                    startPolling();
+                    reindexBtn.disabled = true;
+                    reindexBtn.textContent = 'Indexing...';
+                } else if (progress.done) {
+                    // Just finished — show result
+                    stopPolling();
+                    const total = progress.processed || progress.total || data.total_indexed || 0;
+
+                    if (progress.error) {
+                        statusEl.innerHTML = `Indexing failed: <span style="color:#f85149">${escapeHtml(progress.error)}</span>`;
+                    } else {
+                        statusEl.innerHTML = `Indexed: <span class="count">${total}</span> links`;
+                    }
+
+                    progressBar.style.display = 'none';
+                    progressFill.style.width = '0%';
+                    reindexBtn.disabled = false;
+                    reindexBtn.innerHTML = '&#x1F504; Re-index';
+                } else {
+                    // Idle — normal display
+                    stopPolling();
+                    progressBar.style.display = 'none';
+                    progressFill.style.width = '0%';
+                    reindexBtn.disabled = false;
+                    reindexBtn.innerHTML = '&#x1F504; Re-index';
+
+                    statusEl.innerHTML = `Indexed: <span class="count">${data.total_indexed}</span> links` +
+                        (data.last_index_time ? ` &middot; last: ${new Date(data.last_index_time).toLocaleDateString()}` : '');
+                }
             } catch (err) {
                 statusEl.textContent = 'Status unavailable';
             }
@@ -296,21 +384,22 @@
         }
 
         async function reindex() {
-            const btn = document.getElementById('reindex-btn');
-            btn.textContent = 'Indexing...';
-            btn.disabled = true;
+            reindexBtn.textContent = 'Indexing...';
+            reindexBtn.disabled = true;
             try {
                 const resp = await fetch('/api/index', { method: 'POST' });
                 const data = await resp.json();
-                btn.textContent = `Done (${data.links_indexed} links)`;
-                loadStatus();
+                if (data.status === 'already_running') {
+                    reindexBtn.textContent = 'Already running...';
+                    startPolling();
+                    return;
+                }
+                // Start polling for progress
+                startPolling();
             } catch (err) {
-                btn.textContent = 'Failed';
+                reindexBtn.textContent = 'Failed';
+                reindexBtn.disabled = false;
             }
-            setTimeout(() => {
-                btn.innerHTML = '&#x1F544; Re-index';
-                btn.disabled = false;
-            }, 3000);
         }
 
         function escapeHtml(text) {
