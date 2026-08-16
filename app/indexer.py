@@ -377,6 +377,11 @@ class Indexer:
         new_ids = expected_ids - existing_ids
         removed_ids = existing_ids - expected_ids
 
+        logger.info(
+            f"Diff index: {len(existing_ids)} existing, {len(expected_ids)} expected, "
+            f"{len(new_ids)} new, {len(removed_ids)} removed"
+        )
+
         added = 0
         removed = 0
 

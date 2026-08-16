@@ -1,6 +1,8 @@
 """Flask server — routes and background indexing."""
 
 import os
+import sys
+import logging
 import threading
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template
@@ -9,6 +11,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from .indexer import Indexer
 
 app = Flask(__name__, template_folder="../templates")
+
+# Root logger — writes to stdout so Docker captures it
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
 
 # Background scheduler for periodic indexing
 scheduler = BackgroundScheduler(daemon=True)
