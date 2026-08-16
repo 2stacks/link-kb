@@ -16,6 +16,7 @@
             --tag: #1f6feb22;
             --tag-text: #58a6ff;
             --success: #3fb950;
+            --warn: #d29922;
             --url: #8b949e;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -361,8 +362,21 @@
                     diffIndexBtn.innerHTML = '&#x1F50D; Diff Index';
 
                     const count = data.total_indexed || 0;
+                    const ldCount = data.linkding_count;
                     const lastFull = data.last_index_time || 'never';
                     const lastDiff = data.last_diff_index_time || 'never';
+
+                    // Build links line — show mismatch warning if Linkding count differs
+                    let linksLine;
+                    if (ldCount > 0 && count !== ldCount) {
+                        const diff = count - ldCount;
+                        const label = diff > 0 ? `${diff} extra` : `${Math.abs(diff)} missing`;
+                        linksLine = `<div class="status-line"><span class="status-label">Links:</span><span class="status-value"><span class="count">${count}</span> indexed / <span class="count" style="color:var(--warn)">${ldCount} in Linkding (${label})</span></span></div>`;
+                    } else if (ldCount > 0) {
+                        linksLine = `<div class="status-line"><span class="status-label">Links:</span><span class="status-value"><span class="count">${count}</span> indexed / <span class="count">${ldCount} in Linkding</span></span></div>`;
+                    } else {
+                        linksLine = `<div class="status-line"><span class="status-label">Links:</span><span class="status-value"><span class="count">${count}</span> indexed</span></div>`;
+                    }
 
                     // If diff just finished, show its result
                     let diffResultLine = '';
@@ -371,8 +385,7 @@
                         diffResultLine = `<div class="status-line"><span class="status-label">Result:</span><span class="status-value"><span class="count">${dr.added}</span> added, ${dr.removed} removed, ${dr.unchanged} unchanged</span></div>`;
                     }
 
-                    statusEl.innerHTML =
-                        `<div class="status-line"><span class="status-label">Links:</span><span class="status-value"><span class="count">${count}</span> indexed</span></div>` +
+                    statusEl.innerHTML = linksLine +
                         `<div class="status-line"><span class="status-label">Full:</span><span class="status-value">${formatTime(lastFull)}</span></div>` +
                         `<div class="status-line"><span class="status-label">Diff:</span><span class="status-value">${formatTime(lastDiff)}</span></div>` +
                         diffResultLine;

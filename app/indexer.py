@@ -95,13 +95,19 @@ class Indexer:
     def get_status(self) -> dict:
         """Return indexing status and stats."""
         count = 0
+        linkding_count = -1
         if self.vector_store:
             try:
                 count = self.meta_collection.count()
             except Exception:
                 pass
+            try:
+                linkding_count = self.get_linkding_count()
+            except Exception:
+                pass
         return {
             "total_indexed": count,
+            "linkding_count": linkding_count,
             "last_index_time": self._last_index_time,
             "last_diff_index_time": self._last_diff_index_time,
             "linkding_url": LINKDING_URL,
@@ -188,6 +194,20 @@ class Indexer:
                 break
             offset += limit
         return links
+
+    def get_linkding_count(self) -> int:
+        """Get total bookmark count from Linkding (lightweight, limit=1)."""
+        try:
+            resp = self._session.get(
+                f"{LINKDING_URL}/api/bookmarks/?limit=1&offset=0",
+                headers=self.headers,
+                timeout=30
+            )
+            if resp.status_code == 200:
+                return resp.json().get("count", 0)
+        except Exception as e:
+            logger.warning(f"Failed to get Linkding count: {e}")
+        return -1
 
     def _extract_page_content(self, url: str) -> dict:
         """Fetch and extract text content from a URL."""
