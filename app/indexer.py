@@ -193,6 +193,7 @@ class Indexer:
             if offset + len(results) >= data.get("count", 0):
                 break
             offset += limit
+            time.sleep(0.1)
         return links
 
     def get_linkding_count(self) -> int:

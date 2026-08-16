@@ -12,14 +12,17 @@ from .indexer import Indexer
 
 app = Flask(__name__, template_folder="../templates")
 
-# Root logger — writes to stdout so Docker captures it
+# Logging config
+_log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
 if not logging.getLogger().handlers:
-    _log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
     logging.basicConfig(
         level=_log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stdout,
     )
+
+# Ensure chromadb logger respects LOG_LEVEL
+logging.getLogger("chromadb").setLevel(_log_level)
 
 # Background scheduler for periodic indexing
 scheduler = BackgroundScheduler(daemon=True)
