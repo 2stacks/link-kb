@@ -183,19 +183,7 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=port, debug=debug)
 
 
-# --- Scheduled indexing (runs under gunicorn too) ---
-
-def _schedule_full_index():
-    """Start full indexer on schedule."""
-    global _full_indexing
-    with index_lock:
-        if _full_indexing:
-            return
-        _full_indexing = True
-        _full_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
-    t = threading.Thread(target=_run_full_index, daemon=True)
-    t.start()
-
+# --- Scheduled diff indexing (runs under gunicorn too) ---
 
 def _schedule_diff_index():
     """Start diff indexer on schedule."""
@@ -209,22 +197,8 @@ def _schedule_diff_index():
     t.start()
 
 
-# Full index interval — new var with fallback to old INDEX_INTERVAL_HOURS
-_full_interval = int(os.getenv("FULL_INDEX_INTERVAL_HOURS", os.getenv("INDEX_INTERVAL_HOURS", "24")))
-scheduler.add_job(
-    _schedule_full_index,
-    trigger="interval",
-    hours=_full_interval,
-    max_instances=1,
-    coalesce=True,
-    id="full_index",
-    name="full_index",
-)
-# Run full index on startup (delayed so DB is ready)
-scheduler.add_job(_schedule_full_index, trigger="date", run_date=datetime.now() + timedelta(seconds=5), id="full_index_startup")
-
-# Diff index interval — 0 means disabled
-_diff_interval = int(os.getenv("DIFF_INDEX_INTERVAL_HOURS", "0"))
+# Diff index interval — 0 means disabled (default: 6h)
+_diff_interval = int(os.getenv("DIFF_INDEX_INTERVAL_HOURS", "6"))
 if _diff_interval > 0:
     scheduler.add_job(
         _schedule_diff_index,
