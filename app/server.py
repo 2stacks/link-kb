@@ -23,6 +23,8 @@ if not logging.getLogger().handlers:
 
 # Ensure chromadb logger respects LOG_LEVEL
 logging.getLogger("chromadb").setLevel(_log_level)
+# Silence chromadb telemetry — known posthog version mismatch, not actionable
+logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL + 1)
 
 # Background scheduler for periodic indexing
 scheduler = BackgroundScheduler(daemon=True)
