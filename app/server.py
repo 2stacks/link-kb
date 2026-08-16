@@ -14,8 +14,9 @@ app = Flask(__name__, template_folder="../templates")
 
 # Root logger — writes to stdout so Docker captures it
 if not logging.getLogger().handlers:
+    _log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
     logging.basicConfig(
-        level=logging.INFO,
+        level=_log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stdout,
     )
