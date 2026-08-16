@@ -16,8 +16,10 @@ scheduler = BackgroundScheduler(daemon=True)
 # Lazy-init indexer
 indexer = None
 index_lock = threading.Lock()
-_indexing = False
-_index_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
+_full_indexing = False
+_diff_indexing = False
+_full_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
+_diff_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
 
 
 def get_indexer():
@@ -28,29 +30,55 @@ def get_indexer():
     return indexer
 
 
-def _run_index():
+def _run_full_index():
     """Run full index in background thread."""
-    global _indexing
+    global _full_indexing
     try:
         ix = get_indexer()
         def on_progress(i, total, url):
             with index_lock:
-                _index_progress["processed"] = i
-                _index_progress["total"] = total
-                _index_progress["started_at"] = _index_progress.get("started_at") or datetime.now().isoformat()
-                _index_progress["current_url"] = url
+                _full_progress["processed"] = i
+                _full_progress["total"] = total
+                _full_progress["started_at"] = _full_progress.get("started_at") or datetime.now().isoformat()
+                _full_progress["current_url"] = url
         total = ix.full_index(progress_callback=on_progress)
         with index_lock:
-            _index_progress["total"] = total
-            _index_progress["processed"] = total
-            _index_progress["started_at"] = _index_progress.get("started_at") or datetime.now().isoformat()
-            _index_progress["done"] = True
+            _full_progress["total"] = total
+            _full_progress["processed"] = total
+            _full_progress["started_at"] = _full_progress.get("started_at") or datetime.now().isoformat()
+            _full_progress["done"] = True
     except Exception as e:
         with index_lock:
-            _index_progress["done"] = True
-            _index_progress["error"] = str(e)
+            _full_progress["done"] = True
+            _full_progress["error"] = str(e)
     finally:
-        _indexing = False
+        _full_indexing = False
+
+
+def _run_diff_index():
+    """Run diff index in background thread."""
+    global _diff_indexing
+    try:
+        ix = get_indexer()
+        def on_progress(i, total, url):
+            with index_lock:
+                _diff_progress["processed"] = i
+                _diff_progress["total"] = total
+                _diff_progress["started_at"] = _diff_progress.get("started_at") or datetime.now().isoformat()
+                _diff_progress["current_url"] = url
+        result = ix.diff_index(progress_callback=on_progress)
+        with index_lock:
+            _diff_progress["total"] = result.get("added", 0)
+            _diff_progress["processed"] = result.get("added", 0)
+            _diff_progress["started_at"] = _diff_progress.get("started_at") or datetime.now().isoformat()
+            _diff_progress["diff_result"] = result
+            _diff_progress["done"] = True
+    except Exception as e:
+        with index_lock:
+            _diff_progress["done"] = True
+            _diff_progress["error"] = str(e)
+    finally:
+        _diff_indexing = False
 
 
 @app.route("/")
@@ -84,23 +112,43 @@ def search():
     })
 
 
-@app.route("/api/index", methods=["POST"])
-def trigger_index():
+@app.route("/api/full-index", methods=["POST"])
+def trigger_full_index():
     """Start a full re-index in the background."""
-    global _indexing
+    global _full_indexing
     with index_lock:
-        if _indexing:
+        if _full_indexing:
             return jsonify({
                 "status": "already_running",
-                "progress": _index_progress
+                "progress": _full_progress
             }), 409
-        _indexing = True
-        _index_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
-    t = threading.Thread(target=_run_index, daemon=True)
+        _full_indexing = True
+        _full_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
+    t = threading.Thread(target=_run_full_index, daemon=True)
     t.start()
     return jsonify({
         "status": "started",
-        "message": "Indexing in background. Check /api/status for progress."
+        "message": "Full indexing in background. Check /api/status for progress."
+    })
+
+
+@app.route("/api/diff-index", methods=["POST"])
+def trigger_diff_index():
+    """Start a diff re-index in the background."""
+    global _diff_indexing
+    with index_lock:
+        if _diff_indexing:
+            return jsonify({
+                "status": "already_running",
+                "progress": _diff_progress
+            }), 409
+        _diff_indexing = True
+        _diff_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
+    t = threading.Thread(target=_run_diff_index, daemon=True)
+    t.start()
+    return jsonify({
+        "status": "started",
+        "message": "Diff indexing in background. Check /api/status for progress."
     })
 
 
@@ -109,10 +157,23 @@ def status():
     """Indexing status and stats."""
     ix = get_indexer()
     with index_lock:
-        progress = dict(_index_progress)
+        full_progress = dict(_full_progress)
+        diff_progress = dict(_diff_progress)
     base = ix.get_status()
-    base["indexing"] = _indexing
-    base["progress"] = progress
+    base["full_indexing"] = _full_indexing
+    base["diff_indexing"] = _diff_indexing
+    base["full_progress"] = full_progress
+    base["diff_progress"] = diff_progress
+    # Backward compat aliases — default to whichever is active
+    if _full_indexing:
+        base["indexing"] = True
+        base["progress"] = full_progress
+    elif _diff_indexing:
+        base["indexing"] = True
+        base["progress"] = diff_progress
+    else:
+        base["indexing"] = False
+        base["progress"] = diff_progress if diff_progress.get("done") else full_progress
     return jsonify(base)
 
 
@@ -123,27 +184,58 @@ if __name__ == "__main__":
 
 
 # --- Scheduled indexing (runs under gunicorn too) ---
-def _schedule_index():
-    """Start indexer on schedule."""
-    global _indexing
+
+def _schedule_full_index():
+    """Start full indexer on schedule."""
+    global _full_indexing
     with index_lock:
-        if _indexing:
+        if _full_indexing:
             return
-        _indexing = True
-        _index_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
-    t = threading.Thread(target=_run_index, daemon=True)
+        _full_indexing = True
+        _full_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
+    t = threading.Thread(target=_run_full_index, daemon=True)
     t.start()
 
-# Read interval from env (hours), default 24
-_index_interval = int(os.getenv("INDEX_INTERVAL_HOURS", "24"))
 
+def _schedule_diff_index():
+    """Start diff indexer on schedule."""
+    global _diff_indexing
+    with index_lock:
+        if _diff_indexing or _full_indexing:
+            return
+        _diff_indexing = True
+        _diff_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
+    t = threading.Thread(target=_run_diff_index, daemon=True)
+    t.start()
+
+
+# Full index interval — new var with fallback to old INDEX_INTERVAL_HOURS
+_full_interval = int(os.getenv("FULL_INDEX_INTERVAL_HOURS", os.getenv("INDEX_INTERVAL_HOURS", "24")))
 scheduler.add_job(
-    _schedule_index,
+    _schedule_full_index,
     trigger="interval",
-    hours=_index_interval,
+    hours=_full_interval,
     max_instances=1,
     coalesce=True,
+    id="full_index",
+    name="full_index",
 )
-# Also run immediately on startup (delayed so DB is ready)
-scheduler.add_job(_schedule_index, trigger="date", run_date=datetime.now() + timedelta(seconds=5))
+# Run full index on startup (delayed so DB is ready)
+scheduler.add_job(_schedule_full_index, trigger="date", run_date=datetime.now() + timedelta(seconds=5), id="full_index_startup")
+
+# Diff index interval — 0 means disabled
+_diff_interval = int(os.getenv("DIFF_INDEX_INTERVAL_HOURS", "0"))
+if _diff_interval > 0:
+    scheduler.add_job(
+        _schedule_diff_index,
+        trigger="interval",
+        hours=_diff_interval,
+        max_instances=1,
+        coalesce=True,
+        id="diff_index",
+        name="diff_index",
+    )
+    logger = __import__("logging").getLogger(__name__)
+    logger.info(f"Diff index scheduled every {_diff_interval}h")
+
 scheduler.start()

@@ -74,7 +74,11 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 1.5rem;
+            margin-bottom: 0.5rem;
+        }
+        .controls .btn-group {
+            display: flex;
+            gap: 0.5rem;
         }
         .controls button {
             background: var(--surface);
@@ -85,6 +89,7 @@
             cursor: pointer;
             font-size: 0.8rem;
             transition: all 0.2s;
+            white-space: nowrap;
         }
         .controls button:hover {
             border-color: var(--accent);
@@ -95,9 +100,22 @@
             color: var(--text-dim);
             display: flex;
             flex-direction: column;
-            gap: 0.35rem;
+            gap: 0.25rem;
             flex: 1;
             max-width: 500px;
+            margin-left: 1rem;
+        }
+        .controls .status .status-line {
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+        }
+        .controls .status .status-label {
+            color: var(--text-dim);
+            min-width: 60px;
+        }
+        .controls .status .status-value {
+            color: var(--text);
         }
         .controls .status .count {
             color: var(--success);
@@ -227,11 +245,14 @@
         </div>
 
         <div class="controls">
-            <button id="reindex-btn" onclick="reindex()">&#x1F504; Re-index</button>
-            <span class="status" id="status">Loading status...</span>
-            <div class="progress-bar" id="progress-bar" style="display:none;">
-                <div class="progress-bar-fill" id="progress-fill"></div>
+            <div class="btn-group">
+                <button id="full-index-btn" onclick="fullIndex()">&#x1F504; Full Index</button>
+                <button id="diff-index-btn" onclick="diffIndex()">&#x1F50D; Diff Index</button>
             </div>
+            <span class="status" id="status">Loading status...</span>
+        </div>
+        <div class="progress-bar" id="progress-bar" style="display:none;">
+            <div class="progress-bar-fill" id="progress-fill"></div>
         </div>
 
         <div id="placeholder" class="empty">
@@ -254,7 +275,8 @@
         const statusEl = document.getElementById('status');
         const progressBar = document.getElementById('progress-bar');
         const progressFill = document.getElementById('progress-fill');
-        const reindexBtn = document.getElementById('reindex-btn');
+        const fullIndexBtn = document.getElementById('full-index-btn');
+        const diffIndexBtn = document.getElementById('diff-index-btn');
         let debounceTimer;
         let pollingTimer = null;
 
@@ -288,53 +310,72 @@
             pollingTimer = setInterval(loadStatus, 2000);
         }
 
+        function formatTime(iso) {
+            if (!iso) return 'never';
+            try {
+                return new Date(iso).toLocaleString();
+            } catch {
+                return iso;
+            }
+        }
+
         async function loadStatus() {
             try {
                 const resp = await fetch('/api/status');
                 const data = await resp.json();
-                const progress = data.progress || {};
 
-                if (data.indexing && !progress.done) {
-                    // Indexing in progress — show progress bar
-                    const processed = progress.processed || 0;
-                    const total = progress.total || 0;
+                const fullP = data.full_progress || {};
+                const diffP = data.diff_progress || {};
+                const isFullRunning = data.full_indexing && !fullP.done;
+                const isDiffRunning = data.diff_indexing && !diffP.done;
+
+                // Determine active job for progress bar
+                const active = isFullRunning ? { ...fullP, label: 'Full' } : (isDiffRunning ? { ...diffP, label: 'Diff' } : null);
+
+                if (active) {
+                    // An index job is in progress
+                    const processed = active.processed || 0;
+                    const total = active.total || 0;
                     const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
 
-                    statusEl.innerHTML = `Indexing: <span class="count">${processed}/${total}</span> links (${pct}%)` +
-                        (progress.current_url ? `<div class="current-url">… ${escapeHtml(progress.current_url)}</div>` : '');
+                    statusEl.innerHTML =
+                        `<div class="status-line"><span class="status-label">${active.label}:</span><span class="status-value">Indexing <span class="count">${processed}/${total}</span> (${pct}%)</span></div>` +
+                        (active.current_url ? `<div class="current-url">… ${escapeHtml(active.current_url)}</div>` : '');
 
                     progressBar.style.display = 'block';
                     progressFill.style.width = pct + '%';
 
-                    // Keep polling
                     startPolling();
-                    reindexBtn.disabled = true;
-                    reindexBtn.textContent = 'Indexing...';
-                } else if (progress.done) {
-                    // Just finished — show result
+                    fullIndexBtn.disabled = isFullRunning;
+                    diffIndexBtn.disabled = isDiffRunning;
+                    if (isFullRunning) { fullIndexBtn.textContent = 'Running...'; }
+                    if (isDiffRunning) { diffIndexBtn.textContent = 'Running...'; }
+                } else {
+                    // Idle — show status lines
                     stopPolling();
-                    const total = progress.processed || progress.total || data.total_indexed || 0;
+                    progressBar.style.display = 'none';
+                    progressFill.style.width = '0%';
+                    fullIndexBtn.disabled = false;
+                    diffIndexBtn.disabled = false;
+                    fullIndexBtn.innerHTML = '&#x1F504; Full Index';
+                    diffIndexBtn.innerHTML = '&#x1F50D; Diff Index';
 
-                    if (progress.error) {
-                        statusEl.innerHTML = `Indexing failed: <span style="color:#f85149">${escapeHtml(progress.error)}</span>`;
-                    } else {
-                        statusEl.innerHTML = `Indexed: <span class="count">${total}</span> links`;
+                    const count = data.total_indexed || 0;
+                    const lastFull = data.last_index_time || 'never';
+                    const lastDiff = data.last_diff_index_time || 'never';
+
+                    // If diff just finished, show its result
+                    let diffResultLine = '';
+                    if (diffP.done && diffP.diff_result) {
+                        const dr = diffP.diff_result;
+                        diffResultLine = `<div class="status-line"><span class="status-label">Result:</span><span class="status-value"><span class="count">${dr.added}</span> added, ${dr.removed} removed, ${dr.unchanged} unchanged</span></div>`;
                     }
 
-                    progressBar.style.display = 'none';
-                    progressFill.style.width = '0%';
-                    reindexBtn.disabled = false;
-                    reindexBtn.innerHTML = '&#x1F504; Re-index';
-                } else {
-                    // Idle — normal display
-                    stopPolling();
-                    progressBar.style.display = 'none';
-                    progressFill.style.width = '0%';
-                    reindexBtn.disabled = false;
-                    reindexBtn.innerHTML = '&#x1F504; Re-index';
-
-                    statusEl.innerHTML = `Indexed: <span class="count">${data.total_indexed}</span> links` +
-                        (data.last_index_time ? ` &middot; last: ${new Date(data.last_index_time).toLocaleDateString()}` : '');
+                    statusEl.innerHTML =
+                        `<div class="status-line"><span class="status-label">Links:</span><span class="status-value"><span class="count">${count}</span> indexed</span></div>` +
+                        `<div class="status-line"><span class="status-label">Full:</span><span class="status-value">${formatTime(lastFull)}</span></div>` +
+                        `<div class="status-line"><span class="status-label">Diff:</span><span class="status-value">${formatTime(lastDiff)}</span></div>` +
+                        diffResultLine;
                 }
             } catch (err) {
                 statusEl.textContent = 'Status unavailable';
@@ -383,22 +424,39 @@
             }
         }
 
-        async function reindex() {
-            reindexBtn.textContent = 'Indexing...';
-            reindexBtn.disabled = true;
+        async function fullIndex() {
+            fullIndexBtn.textContent = 'Running...';
+            fullIndexBtn.disabled = true;
             try {
-                const resp = await fetch('/api/index', { method: 'POST' });
+                const resp = await fetch('/api/full-index', { method: 'POST' });
                 const data = await resp.json();
                 if (data.status === 'already_running') {
-                    reindexBtn.textContent = 'Already running...';
+                    fullIndexBtn.textContent = 'Already running...';
                     startPolling();
                     return;
                 }
-                // Start polling for progress
                 startPolling();
             } catch (err) {
-                reindexBtn.textContent = 'Failed';
-                reindexBtn.disabled = false;
+                fullIndexBtn.textContent = 'Failed';
+                fullIndexBtn.disabled = false;
+            }
+        }
+
+        async function diffIndex() {
+            diffIndexBtn.textContent = 'Running...';
+            diffIndexBtn.disabled = true;
+            try {
+                const resp = await fetch('/api/diff-index', { method: 'POST' });
+                const data = await resp.json();
+                if (data.status === 'already_running') {
+                    diffIndexBtn.textContent = 'Already running...';
+                    startPolling();
+                    return;
+                }
+                startPolling();
+            } catch (err) {
+                diffIndexBtn.textContent = 'Failed';
+                diffIndexBtn.disabled = false;
             }
         }
 

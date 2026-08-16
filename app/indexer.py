@@ -53,6 +53,7 @@ class Indexer:
         self.embed_url = f"{EMBEDDING_URL}/v1/embeddings"
         self.vector_store = None
         self._last_index_time = None
+        self._last_diff_index_time = None
         self._total_indexed = 0
         # Persistent session with connection pooling to avoid CLOSE-WAIT buildup on llama-swap.
         # Retries on read-timeout handle stale pooled connections (T4 server closes idle sockets).
@@ -102,6 +103,7 @@ class Indexer:
         return {
             "total_indexed": count,
             "last_index_time": self._last_index_time,
+            "last_diff_index_time": self._last_diff_index_time,
             "linkding_url": LINKDING_URL,
             "embedding_model": EMBEDDING_MODEL,
             "db_path": DB_PATH,
@@ -326,6 +328,101 @@ class Indexer:
         self._total_indexed = len(links)
         logger.info(f"Index complete: {self._total_indexed} links stored")
         return self._total_indexed
+
+    def diff_index(self, progress_callback=None) -> dict:
+        """Incremental index — only process new or removed links.
+
+        Compares current Linkding bookmarks against what's in ChromaDB.
+        New links get extracted and embedded; removed links are deleted.
+        Unchanged links are skipped entirely.
+
+        Args:
+            progress_callback: Optional callable(i, total, url) called after each link.
+
+        Returns:
+            dict with 'added', 'removed', 'unchanged' counts.
+        """
+        logger.info("Starting diff index...")
+
+        if not self.vector_store:
+            self.init_db()
+
+        links = self._fetch_linkding_links()
+        logger.info(f"Fetched {len(links)} links from Linkding")
+
+        # Get current indexed IDs
+        existing_ids = set(self.meta_collection.get(["ids"])["ids"])
+        expected_ids = {f"ld-{link.get('id')}" for link in links}
+
+        new_ids = expected_ids - existing_ids
+        removed_ids = existing_ids - expected_ids
+
+        added = 0
+        removed = 0
+
+        # Remove deleted links
+        if removed_ids:
+            for col_name, col in [("links_meta", self.meta_collection),
+                                  ("links_content", self.content_collection)]:
+                col.delete(ids=list(removed_ids))
+            removed = len(removed_ids)
+            logger.info(f"Removed {removed} stale entries")
+
+        # Index new links
+        new_links = [link for link in links
+                     if f"ld-{link.get('id')}" in new_ids]
+        unchanged = len(links) - len(new_links) - removed
+
+        for i, link in enumerate(new_links):
+            url = link.get("url", "")
+            if not url:
+                continue
+
+            logger.info(f"Processing new [{i+1}/{len(new_links)}]: {url}")
+
+            if progress_callback:
+                try:
+                    progress_callback(i + 1, len(new_links), url)
+                except Exception:
+                    pass
+
+            page_content = self._extract_page_content(url)
+
+            meta_text = self._build_embedding_text(link, page_content)
+            content_text = self._build_content_text(link, page_content)
+
+            meta_vector = self._embed(meta_text)
+            content_vector = self._embed(content_text)
+
+            metadata = {
+                "url": url,
+                "title": link.get("title", ""),
+                "description": link.get("description", ""),
+                "tags": "|".join(link.get("tag_names", [])),
+                "date_added": link.get("date_added", ""),
+                "date_modified": link.get("date_modified", ""),
+            }
+
+            link_id = f"ld-{link.get('id', i)}"
+            self.meta_collection.upsert(
+                ids=[link_id],
+                embeddings=[meta_vector],
+                metadatas=[metadata],
+                documents=[meta_text]
+            )
+            self.content_collection.upsert(
+                ids=[link_id],
+                embeddings=[content_vector],
+                metadatas=[metadata],
+                documents=[content_text]
+            )
+
+            added += 1
+            time.sleep(0.1)
+
+        self._last_diff_index_time = datetime.now(timezone.utc).isoformat()
+        logger.info(f"Diff index complete: {added} added, {removed} removed, {unchanged} unchanged")
+        return {"added": added, "removed": removed, "unchanged": unchanged}
 
     def _keyword_boost(self, query: str, results: list) -> list:
         """
