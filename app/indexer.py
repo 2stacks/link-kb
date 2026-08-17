@@ -372,7 +372,7 @@ class Indexer:
         logger.info(f"Fetched {len(links)} links from Linkding")
 
         # Get current indexed IDs
-        existing_ids = set(self.meta_collection.get(["ids"])["ids"])
+        existing_ids = set(self.meta_collection.get()["ids"])
         expected_ids = {f"ld-{link.get('id')}" for link in links}
 
         new_ids = expected_ids - existing_ids
