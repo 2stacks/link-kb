@@ -25,6 +25,28 @@ Set `EMBEDDING_URL` and `EMBEDDING_MODEL` in `.env` to match your provider.
 window can handle that (≥2048 tokens). For self-hosted llama.cpp, use `-ub 2048` or
 higher on the embedding server.
 
+## Mid-run embedding outages (circuit breaker)
+
+If the embedding endpoint goes down **during** an index run (a llama-swap
+model swap, a restart, the host user logging out, etc.), the run does not
+grind through the rest of the corpus:
+
+1. On an embed failure a fast, no-retry liveness probe attributes it.
+2. While the endpoint is down/not serving, links are **fast-skipped**
+   (no multi-minute retry chains) and the skip count is shown in the UI.
+3. After `EMBED_BREAKER_THRESHOLD` consecutive bad probes the run **waits**
+   for the endpoint (up to `EMBEDDING_READY_TIMEOUT`) and then **resumes
+   from exactly where it stopped**.
+4. If it does not recover in time the run **aborts with an explicit error**
+   (shown in red in the UI; no false "index complete" timestamp). Partial
+   work is preserved — ChromaDB upserts are idempotent and link-health
+   records are saved every 50 links — so a later full index just re-embeds
+   everything cleanly.
+
+`/api/status` reports `embed_endpoint_state` (`up` / `soft` / `down`,
+re-probed at most every 5 s) and `embed_down_since` while a run is
+waiting on recovery.
+
 ## Architecture
 
 ```
@@ -64,6 +86,9 @@ curl -X POST http://localhost:5000/api/full-index
 | `DB_PATH` | ChromaDB directory | `/data/link-kb` |
 | `EMBEDDING_TIMEOUT` | Per-embed-request timeout (s) | `120` |
 | `EMBEDDING_READY_TIMEOUT` | Cold-start wait for embeddings endpoint (s) | `300` |
+| `EMBEDDING_READY_INTERVAL` | Probe interval for the cold-start wait (s) | `5` |
+| `EMBED_PROBE_TIMEOUT` | Mid-run liveness-probe timeout (s, no retries) | `10` |
+| `EMBED_BREAKER_THRESHOLD` | Consecutive bad probes before the run waits for endpoint recovery | `3` |
 | `HEALTH_TRACKING` | Track link health during indexing (`1`/`0`) | `1` |
 | `FETCH_TIMEOUT` | Per-page fetch timeout (s) | `15` |
 

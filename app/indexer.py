@@ -60,7 +60,17 @@ EMBEDDING_TIMEOUT = int(os.getenv("EMBEDDING_TIMEOUT", "120"))
 # How long an index/search run will wait for the embeddings endpoint to
 # become ready (cold-start model load). Probed every EMBEDDING_READY_INTERVAL s.
 EMBEDDING_READY_TIMEOUT = int(os.getenv("EMBEDDING_READY_TIMEOUT", "300"))
-EMBEDDING_READY_INTERVAL = 5
+EMBEDDING_READY_INTERVAL = int(os.getenv("EMBEDDING_READY_INTERVAL", "5"))
+# Fast liveness probe for the mid-run circuit breaker: no retries (retries
+# are for real embeds, not probes) and a short timeout so a dead endpoint
+# is detected in seconds, not minutes.
+EMBED_PROBE_TIMEOUT = int(os.getenv("EMBED_PROBE_TIMEOUT", "10"))
+# Consecutive failed probes after an embed failure before the run stops
+# grinding and waits for the endpoint to recover.
+EMBED_BREAKER_THRESHOLD = int(os.getenv("EMBED_BREAKER_THRESHOLD", "3"))
+# Persist link_health.json every N links during a run (so an aborted run
+# still yields its dead/redirected report for the portion that completed).
+HEALTH_SAVE_EVERY = 50
 
 
 class EmbeddingError(Exception):
@@ -68,6 +78,16 @@ class EmbeddingError(Exception):
 
     Callers must NOT store a zero-vector fallback — a zero embedding
     silently destroys search relevance.
+    """
+
+
+class IndexAbortedError(Exception):
+    """Raised when an index run aborts early.
+
+    E.g. the embedding endpoint went down mid-run and did not recover
+    within EMBEDDING_READY_TIMEOUT. Partial work (ChromaDB upserts and
+    persisted health records) is safe — the next full index re-embeds
+    everything cleanly.
     """
 
 
@@ -83,6 +103,7 @@ class Indexer:
         self._last_diff_index_time = None
         self._total_indexed = 0
         self._embed_failed = []
+        self._embed_down_since = None  # ISO ts while the breaker is waiting on recovery
         self._health = {}
         self._load_status()
         self._load_health()
@@ -92,12 +113,22 @@ class Indexer:
         # Cold-start unavailability is handled by _wait_for_embeddings() before runs start.
         self._session = requests.Session()
         retry = Retry(
-            total=6, connect=6, read=5, backoff_factor=2,
+            total=6, connect=6, read=5,
+            backoff_factor=float(os.getenv("EMBED_RETRY_BACKOFF", "2")),
             allowed_methods=frozenset({"GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"}),
         )
         adapter = requests.adapters.HTTPAdapter(pool_maxsize=4, pool_connections=4, max_retries=retry)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
+        # Probe session: NO retries. A liveness probe must cost at most
+        # EMBED_PROBE_TIMEOUT — with the pooled retry chain a single probe
+        # against a dead endpoint could block for minutes.
+        self._probe_session = requests.Session()
+        # Endpoint-state cache for /api/status: the UI polls every 2s, so we
+        # re-probe at most once per 5s (a probe can block up to
+        # EMBED_PROBE_TIMEOUT; we must not stack those on the serving worker).
+        self._probe_state = None
+        self._probe_state_at = 0.0
         # Separate session for page fetches: modest retries (a dead page should
         # fail fast, not burn a minute of backoff per link).
         self._fetch_session = requests.Session()
@@ -208,8 +239,22 @@ class Indexer:
             "db_path": DB_PATH,
             "embedding_dim": EMBED_DIM,
             "embed_failed_count": len(self._embed_failed),
+            "embed_endpoint_state": self._probe_endpoint_cached(),
+            "embed_down_since": self._embed_down_since,
             "link_health": self.get_health_summary(),
         }
+
+    def _probe_endpoint_cached(self, max_age_s: float = 5.0) -> str:
+        """Endpoint state for /api/status, re-probed at most once per max_age_s.
+
+        A probe can block up to EMBED_PROBE_TIMEOUT; the UI polls every 2s, so
+        caching keeps the serving worker from stacking blocking probes.
+        """
+        now = time.time()
+        if self._probe_state is None or (now - self._probe_state_at) >= max_age_s:
+            self._probe_state = self._probe_endpoint()
+            self._probe_state_at = now
+        return self._probe_state
 
     def _embed(self, text: str) -> list:
         """Send text to llama-swap embedding endpoint.
@@ -266,17 +311,35 @@ class Indexer:
             raise EmbeddingError(f"{e} - {body}") from e
 
     def _probe_embeddings(self) -> bool:
-        """Cheap liveness probe: POST one trivial token, expect a 200."""
+        """Cheap liveness probe: POST one trivial token, expect a 200.
+
+        Uses the no-retry probe session (a probe must cost at most
+        EMBED_PROBE_TIMEOUT, not the pooled session's full retry chain).
+        """
+        return self._probe_endpoint() == "up"
+
+    def _probe_endpoint(self) -> str:
+        """Classify the embedding endpoint: 'up', 'soft', or 'down'.
+
+        up   — 200, endpoint fully serving
+        soft — the server answered with 4xx/5xx (llama-swap swapping models,
+               model busy, health-check timeout). It is ALIVE but not
+               serving; the request is definitive, so retrying it is waste.
+        down — connection-level failure (refused/reset/timeout): the process
+               is gone. This is what the circuit breaker counts.
+        """
         try:
-            resp = self._session.post(
+            resp = self._probe_session.post(
                 self.embed_url,
                 json={"model": EMBEDDING_MODEL, "input": "ping"},
-                timeout=EMBEDDING_TIMEOUT,
+                timeout=EMBED_PROBE_TIMEOUT,
             )
-            return resp.status_code == 200
+            if resp.status_code == 200:
+                return "up"
+            return "soft"
         except Exception as e:
             logger.debug(f"Embedding probe failed: {e}")
-            return False
+            return "down"
 
     def _wait_for_embeddings(self, deadline_s: int = None, what: str = "") -> None:
         """Block until the embedding endpoint answers, for cold llama-swap starts.
@@ -303,6 +366,61 @@ class Indexer:
         raise EmbeddingError(
             f"Embeddings endpoint {self.embed_url} not ready after {deadline_s}s"
         )
+
+    def _breaker_check(self, url: str, failed: int, down_streak: int,
+                       state: str | None = None) -> tuple:
+        """Circuit breaker for a link whose endpoint state is not 'up'.
+
+        Callers invoke this after a liveness probe (pre-embed) or a failed
+        embed reported the endpoint 'soft' (server alive but not serving —
+        llama-swap swapping/health-checking the model: definitive 4xx/5xx,
+        retrying is waste) or 'down' (connection refused/reset — the process
+        is gone). When state is None a fresh probe is taken (post-embed
+        failures: the endpoint was up at probe time, re-probe to attribute).
+
+        Each call counts one bad state and fast-skips the current link (no
+        multi-minute retry chain). After EMBED_BREAKER_THRESHOLD consecutive
+        bad states the run stops grinding: it waits up to
+        EMBEDDING_READY_TIMEOUT for recovery, then either resumes (returning
+        recovered=True so the caller retries the current link) or aborts.
+
+        Returns (down_streak, recovered). Raises IndexAbortedError if the
+        endpoint did not recover in time.
+        """
+        if state is None:
+            state = self._probe_endpoint()
+        if state == "up":
+            # Endpoint is up — the failure was a one-off (stale socket,
+            # mid-swap). Reset the streak and let the caller skip this link.
+            return 0, False
+        down_streak += 1
+        logger.warning(
+            f"Embeddings endpoint {state.upper()} (streak {down_streak}/"
+            f"{EMBED_BREAKER_THRESHOLD}); skipping {url} without retries"
+        )
+        if down_streak >= EMBED_BREAKER_THRESHOLD:
+            self._embed_down_since = datetime.now(timezone.utc).isoformat()
+            logger.warning(
+                f"Embeddings endpoint not serving since {self._embed_down_since} — "
+                f"index will wait up to {EMBEDDING_READY_TIMEOUT}s for recovery "
+                f"and resume from where it stopped."
+            )
+            try:
+                self._wait_for_embeddings(what="recovery after mid-run outage")
+            except EmbeddingError:
+                self._save_health()  # keep the report for the completed portion
+                raise IndexAbortedError(
+                    f"Embeddings endpoint {self.embed_url} unreachable — "
+                    f"waited {EMBEDDING_READY_TIMEOUT}s after skipping "
+                    f"{failed} link(s) and it did not recover. "
+                    f"Partial index preserved; re-run after the endpoint is back."
+                ) from None
+            # Recovered: reset the breaker and tell the caller to retry this
+            # link — it was skipped by the outage, not actually failed.
+            self._embed_down_since = None
+            logger.info("Embeddings endpoint recovered — resuming index run")
+            return 0, True
+        return down_streak, False
 
     def _cleanup_poisoned_vectors(self) -> int:
         """Delete zero-embedding entries left behind by pre-v1.0.15 failure modes.
@@ -645,6 +763,7 @@ class Indexer:
                 col.delete(ids=stale)
                 logger.info(f"Removed {len(stale)} stale entries from {col_name}")
 
+        down_streak = 0  # circuit breaker state (consecutive non-up probes)
         for i, link in enumerate(links):
             url = link.get("url", "")
             if not url:
@@ -666,14 +785,42 @@ class Indexer:
             meta_text = self._build_embedding_text(link, page_content)
             content_text = self._build_content_text(link, page_content)
 
-            # Get embeddings — skip the link rather than storing a zero vector
+            # Pre-embed liveness check: costs a few ms when the endpoint is
+            # up; saves a guaranteed multi-minute retry chain while it is
+            # down (llama-swap swap, restart, host logout, ...).
+            state = self._probe_endpoint()
+            if state != "up":
+                logger.info(f"Embeddings endpoint {state} — fast-skipping {url}")
+                self._embed_failed.append(url)
+                down_streak, recovered = self._breaker_check(
+                    url, len(self._embed_failed), down_streak, state=state)
+                if not recovered:
+                    continue
+                # Endpoint recovered mid-wait — (re)try this link below.
+                logger.info(f"Endpoint recovered — retrying {url}")
+
+            # Get embeddings — skip the link rather than storing a zero vector.
+            # On failure (endpoint was up but the request failed) the breaker
+            # re-probes to attribute it: one-off blip vs new outage.
             try:
                 meta_vector = self._embed(meta_text)
                 content_vector = self._embed(content_text)
+                down_streak = 0  # success resets the breaker
             except EmbeddingError as e:
-                logger.error(f"Embedding failed, skipping {url}: {e}")
+                logger.error(f"Embedding failed for {url}: {e}")
                 self._embed_failed.append(url)
-                continue
+                down_streak, recovered = self._breaker_check(url, len(self._embed_failed), down_streak)
+                if not recovered:
+                    continue
+                # Endpoint recovered mid-wait — retry this link once.
+                logger.info(f"Endpoint recovered — retrying {url}")
+                try:
+                    meta_vector = self._embed(meta_text)
+                    content_vector = self._embed(content_text)
+                    down_streak = 0
+                except EmbeddingError as e2:
+                    logger.error(f"Retry after recovery failed for {url}, skipping: {e2}")
+                    continue
 
             # ChromaDB metadata
             metadata = {
@@ -700,11 +847,17 @@ class Indexer:
                 documents=[content_text]
             )
 
+            # Persist health records periodically so an aborted run still
+            # yields its dead/redirected report for the completed portion.
+            if (i + 1) % HEALTH_SAVE_EVERY == 0:
+                self._save_health()
+
             # Small throttle to avoid overwhelming T4 llama-server
             time.sleep(0.1)
 
         self._last_index_time = datetime.now(timezone.utc).isoformat()
         self._total_indexed = len(links)
+        self._embed_down_since = None
         self._prune_health(expected_ids)
         self._save_status()
         self._save_health()
@@ -764,6 +917,7 @@ class Indexer:
                      if f"ld-{link.get('id')}" in new_ids]
         unchanged = len(links) - len(new_links) - removed
 
+        down_streak = 0  # circuit breaker state (consecutive non-up probes)
         for i, link in enumerate(new_links):
             url = link.get("url", "")
             if not url:
@@ -782,13 +936,35 @@ class Indexer:
             meta_text = self._build_embedding_text(link, page_content)
             content_text = self._build_content_text(link, page_content)
 
+            # Pre-embed liveness check: cheap when up, saves a guaranteed
+            # multi-minute retry chain while the endpoint is down.
+            state = self._probe_endpoint()
+            if state != "up":
+                self._embed_failed.append(url)
+                down_streak, recovered = self._breaker_check(
+                    url, len(self._embed_failed), down_streak, state=state)
+                if not recovered:
+                    continue
+
             try:
                 meta_vector = self._embed(meta_text)
                 content_vector = self._embed(content_text)
+                down_streak = 0  # success resets the breaker
             except EmbeddingError as e:
-                logger.error(f"Embedding failed, skipping {url}: {e}")
+                logger.error(f"Embedding failed for {url}: {e}")
                 self._embed_failed.append(url)
-                continue
+                down_streak, recovered = self._breaker_check(url, len(self._embed_failed), down_streak)
+                if not recovered:
+                    continue
+                # Endpoint recovered mid-wait — retry this link once.
+                logger.info(f"Endpoint recovered — retrying {url}")
+                try:
+                    meta_vector = self._embed(meta_text)
+                    content_vector = self._embed(content_text)
+                    down_streak = 0
+                except EmbeddingError as e2:
+                    logger.error(f"Retry after recovery failed for {url}, skipping: {e2}")
+                    continue
 
             metadata = {
                 "url": url,
@@ -817,6 +993,7 @@ class Indexer:
             time.sleep(0.1)
 
         self._last_diff_index_time = datetime.now(timezone.utc).isoformat()
+        self._embed_down_since = None
         self._prune_health(expected_ids)
         self._save_status()
         self._save_health()

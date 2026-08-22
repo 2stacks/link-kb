@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from .indexer import Indexer, EmbeddingError
+from .indexer import Indexer, EmbeddingError, IndexAbortedError
 
 app = Flask(__name__, template_folder="../templates")
 
@@ -25,6 +25,8 @@ if not logging.getLogger().handlers:
 logging.getLogger("chromadb").setLevel(_log_level)
 # Silence chromadb telemetry — known posthog version mismatch, not actionable
 logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL + 1)
+
+logger = logging.getLogger(__name__)
 
 # Background scheduler for periodic indexing
 scheduler = BackgroundScheduler(daemon=True)
@@ -63,6 +65,14 @@ def _run_full_index():
             _full_progress["processed"] = total
             _full_progress["started_at"] = _full_progress.get("started_at") or datetime.now().isoformat()
             _full_progress["done"] = True
+    except IndexAbortedError as e:
+        # Abort due to embedding outage — NOT a success. Keep the run's
+        # position so the UI can show where it stopped and why.
+        logger.error(f"Full index aborted: {e}")
+        with index_lock:
+            _full_progress["done"] = True
+            _full_progress["error"] = str(e)
+            _full_progress["aborted"] = True
     except Exception as e:
         with index_lock:
             _full_progress["done"] = True
@@ -89,6 +99,12 @@ def _run_diff_index():
             _diff_progress["started_at"] = _diff_progress.get("started_at") or datetime.now().isoformat()
             _diff_progress["diff_result"] = result
             _diff_progress["done"] = True
+    except IndexAbortedError as e:
+        logger.error(f"Diff index aborted: {e}")
+        with index_lock:
+            _diff_progress["done"] = True
+            _diff_progress["error"] = str(e)
+            _diff_progress["aborted"] = True
     except Exception as e:
         with index_lock:
             _diff_progress["done"] = True
@@ -232,6 +248,9 @@ def _schedule_full_index():
         if _full_indexing:
             return
         _full_indexing = True
+        # Always start from a clean progress state — a run that died in a
+        # previous process generation (container restart, worker recycle)
+        # would otherwise leave the UI stuck on a stale in-memory "indexing".
         _full_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
     t = threading.Thread(target=_run_full_index, daemon=True)
     t.start()

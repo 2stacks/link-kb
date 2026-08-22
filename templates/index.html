@@ -122,6 +122,13 @@
             color: var(--success);
             font-weight: 600;
         }
+        .controls .status .status-value .warn {
+            color: var(--warn);
+        }
+        .controls .status .status-value .err {
+            color: #f85149;
+            font-weight: 600;
+        }
         .controls .status .current-url {
             font-size: 0.75rem;
             color: var(--text-dim);
@@ -339,9 +346,23 @@
                     const total = active.total || 0;
                     const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
 
-                    statusEl.innerHTML =
-                        `<div class="status-line"><span class="status-label">${active.label}:</span><span class="status-value">Indexing <span class="count">${processed}/${total}</span> (${pct}%)</span></div>` +
-                        (active.current_url ? `<div class="current-url">… ${escapeHtml(active.current_url)}</div>` : '');
+                    let html =
+                        `<div class="status-line"><span class="status-label">${active.label}:</span><span class="status-value">Indexing <span class="count">${processed}/${total}</span> (${pct}%)</span></div>`;
+
+                    // Aborted run (e.g. embedding outage) — show the reason, not a success
+                    if (active.aborted || (active.done && active.error)) {
+                        html += `<div class="status-line"><span class="status-label">Stopped:</span><span class="status-value"><span class="err">${escapeHtml(active.error || 'index error')}</span></span></div>`;
+                        html += `<div class="status-line"><span class="status-value" style="color:var(--text-dim);font-size:0.75rem;">Partial index preserved — re-run Full Index once the embedding endpoint is back.</span></div>`;
+                    } else if (data.embed_endpoint_state && data.embed_endpoint_state !== 'up') {
+                        // Endpoint outage mid-run (breaker is waiting for recovery)
+                        const since = data.embed_down_since ? ` (since ${formatTime(data.embed_down_since)})` : '';
+                        html += `<div class="status-line"><span class="status-value"><span class="err">Embeddings ${escapeHtml(data.embed_endpoint_state)}${since} — waiting for recovery, will resume automatically</span></span></div>`;
+                    } else if ((data.embed_failed_count || 0) > 0) {
+                        html += `<div class="status-line"><span class="status-value"><span class="warn">${data.embed_failed_count} link(s) skipped (embed failed)</span></span></div>`;
+                    }
+
+                    html += (active.current_url ? `<div class="current-url">… ${escapeHtml(active.current_url)}</div>` : '');
+                    statusEl.innerHTML = html;
 
                     progressBar.style.display = 'block';
                     progressFill.style.width = pct + '%';
