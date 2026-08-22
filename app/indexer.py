@@ -13,6 +13,7 @@ Search strategy:
 
 import os
 import re
+import json
 import time
 import logging
 import requests
@@ -33,6 +34,7 @@ EMBEDDING_URL = os.getenv("EMBEDDING_URL", "http://localhost:8080")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text-v1.5")
 DB_PATH = os.getenv("DB_PATH", "/data/link-kb")  # ChromaDB uses a directory
 EMBED_DIM = None  # auto-detected from first embedding response
+STATUS_FILE = os.path.join(DB_PATH, "status.json")
 
 # Truncation limit — T4 nomic-embed has a 2048 token physical batch (-ub 2048).
 # 2048 tokens ≈ 8000 chars. Leave headroom for title/tags/description (~200 chars).
@@ -55,6 +57,7 @@ class Indexer:
         self._last_index_time = None
         self._last_diff_index_time = None
         self._total_indexed = 0
+        self._load_status()
         # Persistent session with connection pooling to avoid CLOSE-WAIT buildup on llama-swap.
         # Retries on read-timeout handle stale pooled connections (T4 server closes idle sockets).
         self._session = requests.Session()
@@ -62,6 +65,29 @@ class Indexer:
         adapter = requests.adapters.HTTPAdapter(pool_maxsize=4, pool_connections=4, max_retries=retry)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
+
+    def _load_status(self):
+        """Load persisted timestamps from disk."""
+        try:
+            if os.path.exists(STATUS_FILE):
+                with open(STATUS_FILE, "r") as f:
+                    data = json.load(f)
+                self._last_index_time = data.get("last_index_time")
+                self._last_diff_index_time = data.get("last_diff_index_time")
+        except Exception as e:
+            logger.debug(f"Failed to load status: {e}")
+
+    def _save_status(self):
+        """Persist timestamps to disk."""
+        try:
+            os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+            with open(STATUS_FILE, "w") as f:
+                json.dump({
+                    "last_index_time": self._last_index_time,
+                    "last_diff_index_time": self._last_diff_index_time,
+                }, f)
+        except Exception as e:
+            logger.warning(f"Failed to save status: {e}")
 
     def init_db(self):
         """Initialize ChromaDB persistent store with two collections."""
@@ -347,6 +373,7 @@ class Indexer:
 
         self._last_index_time = datetime.now(timezone.utc).isoformat()
         self._total_indexed = len(links)
+        self._save_status()
         logger.info(f"Index complete: {self._total_indexed} links stored")
         return self._total_indexed
 
@@ -447,6 +474,7 @@ class Indexer:
             time.sleep(0.1)
 
         self._last_diff_index_time = datetime.now(timezone.utc).isoformat()
+        self._save_status()
         logger.info(f"Diff index complete: {added} added, {removed} removed, {unchanged} unchanged")
         return {"added": added, "removed": removed, "unchanged": unchanged}
 
