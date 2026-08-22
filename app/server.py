@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from .indexer import Indexer
+from .indexer import Indexer, EmbeddingError
 
 app = Flask(__name__, template_folder="../templates")
 
@@ -119,7 +119,12 @@ def search():
         return jsonify({"error": "Missing query parameter 'q'"}), 400
 
     ix = get_indexer()
-    results = ix.search(query, limit=limit)
+    try:
+        results = ix.search(query, limit=limit)
+    except EmbeddingError as e:
+        return jsonify({
+            "error": f"Embedding service unavailable: {e}"
+        }), 503
 
     return jsonify({
         "query": query,

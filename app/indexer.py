@@ -17,7 +17,7 @@ import json
 import time
 import logging
 import requests
-import urllib3
+from urllib3.util import Retry
 import chromadb
 import trafilatura
 from datetime import datetime, timezone
@@ -43,7 +43,22 @@ MAX_CONTENT_LEN = 7000
 # Query augmentation template — tells the embedding model to produce a
 # retrieval-oriented vector rather than a definition/description vector.
 QUERY_TEMPLATE = "Find bookmarks about: {query}"
-EMBEDDING_TIMEOUT = int(os.getenv("EMBEDDING_TIMEOUT", "30"))
+# Per-request timeout for embedding calls (seconds). llama-swap can block
+# for a long time while loading a model on a cold start; the readiness gate
+# handles that, but a swap mid-run can also block.
+EMBEDDING_TIMEOUT = int(os.getenv("EMBEDDING_TIMEOUT", "120"))
+# How long an index/search run will wait for the embeddings endpoint to
+# become ready (cold-start model load). Probed every EMBEDDING_READY_INTERVAL s.
+EMBEDDING_READY_TIMEOUT = int(os.getenv("EMBEDDING_READY_TIMEOUT", "300"))
+EMBEDDING_READY_INTERVAL = 5
+
+
+class EmbeddingError(Exception):
+    """Raised when the embedding endpoint is unreachable or errors.
+
+    Callers must NOT store a zero-vector fallback — a zero embedding
+    silently destroys search relevance.
+    """
 
 
 class Indexer:
@@ -57,11 +72,17 @@ class Indexer:
         self._last_index_time = None
         self._last_diff_index_time = None
         self._total_indexed = 0
+        self._embed_failed = []
         self._load_status()
         # Persistent session with connection pooling to avoid CLOSE-WAIT buildup on llama-swap.
-        # Retries on read-timeout handle stale pooled connections (T4 server closes idle sockets).
+        # Generous connect/read retries with exponential backoff handle both stale pooled
+        # connections (T4 server closes idle sockets) and mid-run llama-swap model swaps.
+        # Cold-start unavailability is handled by _wait_for_embeddings() before runs start.
         self._session = requests.Session()
-        retry = urllib3.util.Retry(total=5, read=4, backoff_factor=0.1)
+        retry = Retry(
+            total=6, connect=6, read=5, backoff_factor=2,
+            allowed_methods=frozenset({"GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"}),
+        )
         adapter = requests.adapters.HTTPAdapter(pool_maxsize=4, pool_connections=4, max_retries=retry)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
@@ -140,6 +161,7 @@ class Indexer:
             "embedding_model": EMBEDDING_MODEL,
             "db_path": DB_PATH,
             "embedding_dim": EMBED_DIM,
+            "embed_failed_count": len(self._embed_failed),
         }
 
     def _embed(self, text: str) -> list:
@@ -168,18 +190,21 @@ class Indexer:
                 norm = (sum(v*v for v in mean_emb) ** 0.5) or 1.0
                 mean_emb = [v / norm for v in mean_emb]
                 return mean_emb
-            return [0.0] * (EMBED_DIM or 768)
+            raise EmbeddingError("all embedding chunks came back empty or zero")
 
         return self._single_embed(text)
 
     def _single_embed(self, text: str) -> list:
-        """Embed a single text chunk, returning zero vector on failure."""
+        """Embed a single text chunk.
+
+        Raises EmbeddingError on failure — callers must NOT persist a
+        zero-vector fallback (it silently destroys search relevance).
+        """
         global EMBED_DIM
         payload = {
             "model": EMBEDDING_MODEL,
             "input": text
         }
-        resp = None
         try:
             resp = self._session.post(self.embed_url, json=payload, timeout=EMBEDDING_TIMEOUT)
             resp.raise_for_status()
@@ -190,10 +215,80 @@ class Indexer:
                 logger.info(f"Detected embedding dim: {EMBED_DIM}")
             return embedding
         except Exception as e:
-            body = resp.text if resp is not None else "no response"
-            logger.error(f"Embedding failed: {e} - {body}")
-            dim = EMBED_DIM or 768
-            return [0.0] * dim
+            body = resp.text[:300] if resp is not None else "no response"
+            raise EmbeddingError(f"{e} - {body}") from e
+
+    def _probe_embeddings(self) -> bool:
+        """Cheap liveness probe: POST one trivial token, expect a 200."""
+        try:
+            resp = self._session.post(
+                self.embed_url,
+                json={"model": EMBEDDING_MODEL, "input": "ping"},
+                timeout=EMBEDDING_TIMEOUT,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.debug(f"Embedding probe failed: {e}")
+            return False
+
+    def _wait_for_embeddings(self, deadline_s: int = None, what: str = "") -> None:
+        """Block until the embedding endpoint answers, for cold llama-swap starts.
+
+        Raises EmbeddingError if the endpoint is still down after the deadline.
+        """
+        deadline_s = deadline_s if deadline_s is not None else EMBEDDING_READY_TIMEOUT
+        if self._probe_embeddings():
+            return
+        label = f" for {what}" if what else ""
+        logger.warning(
+            f"Embeddings endpoint not responding{label} — waiting up to {deadline_s}s "
+            f"(llama-swap cold start?). Probing every {EMBEDDING_READY_INTERVAL}s."
+        )
+        waited = 0
+        while waited < deadline_s:
+            time.sleep(EMBEDDING_READY_INTERVAL)
+            waited += EMBEDDING_READY_INTERVAL
+            if self._probe_embeddings():
+                logger.info(f"Embeddings endpoint ready after {waited}s")
+                return
+            if waited % 30 == 0:  # periodic status, not per-probe spam
+                logger.info(f"Still waiting for embeddings endpoint ({waited}s/{deadline_s}s)")
+        raise EmbeddingError(
+            f"Embeddings endpoint {self.embed_url} not ready after {deadline_s}s"
+        )
+
+    def _cleanup_poisoned_vectors(self) -> int:
+        """Delete zero-embedding entries left behind by pre-v1.0.15 failure modes.
+
+        Old code stored zero vectors when the embedding call failed, which
+        silently destroys cosine similarity for those links. Returns the
+        number of entries removed.
+        """
+        removed = 0
+        for col_name, col in [("links_meta", self.meta_collection),
+                              ("links_content", self.content_collection)]:
+            try:
+                data = col.get(include=["embeddings"])
+            except Exception as e:
+                logger.warning(f"Could not scan {col_name} for poisoned vectors: {e}")
+                continue
+            ids = data.get("ids") or []
+            embeddings = data.get("embeddings")
+            bad = []
+            for doc_id, emb in zip(ids, embeddings if embeddings is not None else []):
+                # emb is a list or numpy row — check for all-zero / empty
+                try:
+                    if emb is None or len(emb) == 0 or all(v == 0.0 for v in emb):
+                        bad.append(doc_id)
+                except Exception:
+                    bad.append(doc_id)  # unreadable vector — safer to re-embed
+            if bad:
+                col.delete(ids=bad)
+                removed += len(bad)
+                logger.info(f"Removed {len(bad)} zero-embedding entries from {col_name}: {bad[:5]}{'...' if len(bad) > 5 else ''}")
+        if removed:
+            logger.info(f"Poisoned-vector cleanup: {removed} entries deleted — they will be re-embedded on this run")
+        return removed
 
     def _chunk_text(self, text: str, max_chars: int = 800) -> list:
         """Split text into chunks that fit within token limits."""
@@ -303,6 +398,10 @@ class Indexer:
         if not self.vector_store:
             self.init_db()
 
+        self._wait_for_embeddings(what="full index")
+        self._cleanup_poisoned_vectors()
+        self._embed_failed = []
+
         links = self._fetch_linkding_links()
         logger.info(f"Fetched {len(links)} links from Linkding")
 
@@ -339,9 +438,14 @@ class Indexer:
             meta_text = self._build_embedding_text(link, page_content)
             content_text = self._build_content_text(link, page_content)
 
-            # Get embeddings
-            meta_vector = self._embed(meta_text)
-            content_vector = self._embed(content_text)
+            # Get embeddings — skip the link rather than storing a zero vector
+            try:
+                meta_vector = self._embed(meta_text)
+                content_vector = self._embed(content_text)
+            except EmbeddingError as e:
+                logger.error(f"Embedding failed, skipping {url}: {e}")
+                self._embed_failed.append(url)
+                continue
 
             # ChromaDB metadata
             metadata = {
@@ -395,6 +499,10 @@ class Indexer:
         if not self.vector_store:
             self.init_db()
 
+        self._wait_for_embeddings(what="diff index")
+        self._cleanup_poisoned_vectors()
+        self._embed_failed = []
+
         links = self._fetch_linkding_links()
         logger.info(f"Fetched {len(links)} links from Linkding")
 
@@ -444,8 +552,13 @@ class Indexer:
             meta_text = self._build_embedding_text(link, page_content)
             content_text = self._build_content_text(link, page_content)
 
-            meta_vector = self._embed(meta_text)
-            content_vector = self._embed(content_text)
+            try:
+                meta_vector = self._embed(meta_text)
+                content_vector = self._embed(content_text)
+            except EmbeddingError as e:
+                logger.error(f"Embedding failed, skipping {url}: {e}")
+                self._embed_failed.append(url)
+                continue
 
             metadata = {
                 "url": url,
@@ -520,7 +633,13 @@ class Indexer:
         if not self.vector_store:
             self.init_db()
 
-        # Query augmentation — wrap in retrieval prompt
+        # Query augmentation — wrap in retrieval prompt. The readiness gate
+        # keeps a cold llama-swap from silently producing a zero query vector
+        # (which would return garbage rankings). Cap the wait below the
+        # gunicorn worker timeout (300s) or the worker gets killed mid-request.
+        self._wait_for_embeddings(
+            deadline_s=min(EMBEDDING_READY_TIMEOUT, 240), what="search"
+        )
         augmented_query = QUERY_TEMPLATE.format(query=query)
         query_vector = self._embed(augmented_query)
 
