@@ -198,6 +198,25 @@ def status():
     return jsonify(base)
 
 
+@app.route("/api/link-health")
+def link_health():
+    """Link health report (read-only).
+
+    Query params:
+      class: Filter by health class (dead|suspect|redirected|restricted|
+             moved-suspect|unreachable-internal|ok). Omit for all.
+    Returns records sorted worst-first (fail streak desc, then last_checked).
+    """
+    cls = request.args.get("class", "").strip() or None
+    ix = get_indexer()
+    rows = ix.get_link_health(cls)
+    return jsonify({
+        "count": len(rows),
+        "class": cls,
+        "records": rows,
+    })
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"

@@ -6,6 +6,7 @@ Semantic knowledge base for your saved bookmarks. Natural language search over L
 
 - **Indexes** all your Linkding bookmarks — fetches page content via `trafilatura`, embeds with your chosen embedding model
 - **Searches** with natural language — "that tool for monitoring Kubernetes" finds relevant links by semantic similarity
+- **Tracks link health** — every indexed page is classified (ok / dead / moved / blocked / unreachable) with a failure streak, so you can find and prune dead or relocated bookmarks. Report-only: it never writes back to Linkding.
 - **Serves** a minimal web UI for search, plus a REST API
 
 ## Embedding service
@@ -49,7 +50,7 @@ python app.py
 docker compose up -d --build
 
 # 4. Trigger a re-index
-curl -X POST http://localhost:5000/api/index
+curl -X POST http://localhost:5000/api/full-index
 ```
 
 ## Configuration
@@ -58,23 +59,48 @@ curl -X POST http://localhost:5000/api/index
 |---|---|---|
 | `LINKDING_URL` | Linkding base URL | `https://linkding.2stacks.net` |
 | `LINKDING_API_KEY` | Linkding API token | (required) |
-|| `EMBEDDING_URL` | Embedding service base URL | `http://localhost:8080` |
+| | `EMBEDDING_URL` | Embedding service base URL | `http://localhost:8080` |
 | `EMBEDDING_MODEL` | Embedding model ID | `nomic-embed-text-v1.5` |
 | `DB_PATH` | ChromaDB directory | `/data/link-kb` |
+| `EMBEDDING_TIMEOUT` | Per-embed-request timeout (s) | `120` |
+| `EMBEDDING_READY_TIMEOUT` | Cold-start wait for embeddings endpoint (s) | `300` |
+| `HEALTH_TRACKING` | Track link health during indexing (`1`/`0`) | `1` |
+| `FETCH_TIMEOUT` | Per-page fetch timeout (s) | `15` |
+
+## Link health
+
+Every page fetched during indexing is classified and stored in
+`link_health.json` (under `DB_PATH`):
+
+| Class | Meaning |
+|---|---|
+| `ok` | Fetched, HTTP 2xx/3xx |
+| `dead` | HTTP 404/410 |
+| `redirected` | Moved to a new URL (`final_url` + `redirect_streak` recorded) |
+| `restricted` | HTTP 401/402 — exists, but auth/paywalled |
+| `moved-suspect` | HTTP 405 — server alive, page likely moved |
+| `suspect` | 403/429/5xx, timeout, TLS, DNS — may be transient |
+| `unreachable-internal` | Private/reserved IP — unreachable by design, skipped |
+
+`fail_streak` increments on each non-ok check and resets on ok, so a
+one-off hiccup is distinguishable from a persistently dead link. Records
+prune automatically when links are deleted in Linkding.
 
 ## API
 
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/search?q=...` | GET | Semantic search (param: `limit`, default 10) |
-| `/api/index` | POST | Trigger full re-index |
-| `/api/status` | GET | Indexing stats |
+| `/api/full-index` | POST | Trigger full re-index |
+| `/api/diff-index` | POST | Trigger incremental index |
+| `/api/status` | GET | Indexing stats + link-health summary |
+| `/api/link-health` | GET | Health records (param: `class` filter), worst-first |
 
 ## Deploy
 
 1. Update `.env` with your embedding service URL and Linkding API credentials
 2. `docker compose up -d --build`
-3. Trigger initial index: `curl -X POST http://localhost:5000/api/index`
+3. Trigger initial index: `curl -X POST http://localhost:5000/api/full-index`
 
 ## Stack
 

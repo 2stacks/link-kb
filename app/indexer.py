@@ -13,11 +13,13 @@ Search strategy:
 
 import os
 import re
+import ipaddress
 import json
 import time
 import logging
 import requests
 from urllib3.util import Retry
+from urllib.parse import urlparse
 import chromadb
 import trafilatura
 from datetime import datetime, timezone
@@ -35,6 +37,14 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text-v1.5")
 DB_PATH = os.getenv("DB_PATH", "/data/link-kb")  # ChromaDB uses a directory
 EMBED_DIM = None  # auto-detected from first embedding response
 STATUS_FILE = os.path.join(DB_PATH, "status.json")
+# Link health tracking (report-only — never writes to Linkding)
+HEALTH_FILE = os.path.join(DB_PATH, "link_health.json")
+HEALTH_TRACKING = os.getenv("HEALTH_TRACKING", "1") != "0"
+# Per-page fetch timeout for content/health fetches (seconds)
+FETCH_TIMEOUT = int(os.getenv("FETCH_TIMEOUT", "15"))
+# Browser-like UA so plain-HTTP fetches don't trip naive bot walls
+FETCH_USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_664; rv:130.0) Gecko/20100101 "
+                    "Firefox/130.0 link-kb")
 
 # Truncation limit — T4 nomic-embed has a 2048 token physical batch (-ub 2048).
 # 2048 tokens ≈ 8000 chars. Leave headroom for title/tags/description (~200 chars).
@@ -73,7 +83,9 @@ class Indexer:
         self._last_diff_index_time = None
         self._total_indexed = 0
         self._embed_failed = []
+        self._health = {}
         self._load_status()
+        self._load_health()
         # Persistent session with connection pooling to avoid CLOSE-WAIT buildup on llama-swap.
         # Generous connect/read retries with exponential backoff handle both stale pooled
         # connections (T4 server closes idle sockets) and mid-run llama-swap model swaps.
@@ -86,6 +98,16 @@ class Indexer:
         adapter = requests.adapters.HTTPAdapter(pool_maxsize=4, pool_connections=4, max_retries=retry)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
+        # Separate session for page fetches: modest retries (a dead page should
+        # fail fast, not burn a minute of backoff per link).
+        self._fetch_session = requests.Session()
+        fetch_retry = Retry(total=2, connect=2, read=1, backoff_factor=1,
+                            allowed_methods=frozenset({"GET", "HEAD"}))
+        fetch_adapter = requests.adapters.HTTPAdapter(pool_maxsize=4,
+                                                      pool_connections=4,
+                                                      max_retries=fetch_retry)
+        self._fetch_session.mount("http://", fetch_adapter)
+        self._fetch_session.mount("https://", fetch_adapter)
 
     def _load_status(self):
         """Load persisted timestamps from disk."""
@@ -109,6 +131,30 @@ class Indexer:
                 }, f)
         except Exception as e:
             logger.warning(f"Failed to save status: {e}")
+
+    def _load_health(self):
+        """Load persisted link-health records from disk."""
+        self._health = {}
+        if not HEALTH_TRACKING:
+            return
+        try:
+            if os.path.exists(HEALTH_FILE):
+                with open(HEALTH_FILE, "r") as f:
+                    self._health = json.load(f) or {}
+        except Exception as e:
+            logger.debug(f"Failed to load link health: {e}")
+            self._health = {}
+
+    def _save_health(self):
+        """Persist link-health records to disk."""
+        if not HEALTH_TRACKING:
+            return
+        try:
+            os.makedirs(os.path.dirname(HEALTH_FILE), exist_ok=True)
+            with open(HEALTH_FILE, "w") as f:
+                json.dump(self._health, f)
+        except Exception as e:
+            logger.warning(f"Failed to save link health: {e}")
 
     def init_db(self):
         """Initialize ChromaDB persistent store with two collections."""
@@ -162,6 +208,7 @@ class Indexer:
             "db_path": DB_PATH,
             "embedding_dim": EMBED_DIM,
             "embed_failed_count": len(self._embed_failed),
+            "link_health": self.get_health_summary(),
         }
 
     def _embed(self, text: str) -> list:
@@ -331,23 +378,204 @@ class Indexer:
             logger.warning(f"Failed to get Linkding count: {e}")
         return -1
 
-    def _extract_page_content(self, url: str) -> dict:
-        """Fetch and extract text content from a URL."""
+    def _classify_fetch(self, url: str, resp, err) -> dict:
+        """Classify a page fetch for link-health tracking.
+
+        Returns a record fragment: {class, status, reason, last_checked}.
+        err: the exception from the GET (None when resp is not None).
+        """
+        rec: dict = {"last_checked": datetime.now(timezone.utc).isoformat()}
+
+        if err is not None:
+            # Unwrap the exception chain: urllib3/requests wrap the root
+            # cause (e.g. read timeout) inside ConnectionError/MaxRetryError.
+            chain, cause = [], err
+            while cause is not None:
+                chain.append((type(cause).__name__, str(cause)))
+                cause = cause.__cause__ or cause.__context__
+            names = " ".join(n for n, _ in chain)
+            text = " ".join(t for _, t in chain).lower()
+            if "timeout" in names or "timed out" in text:
+                rec.update({"class": "suspect", "status": None, "reason": "timeout"})
+            elif "SSLError" in names:
+                rec.update({"class": "suspect", "status": None, "reason": "tls error"})
+            elif "name" in text and ("resolve" in text or "getaddrinfo" in text):
+                rec.update({"class": "suspect", "status": None, "reason": "dns failure"})
+            else:
+                rec.update({"class": "suspect", "status": None,
+                            "reason": f"connection error: {chain[0][0]}"})
+            return rec
+
+        code = resp.status_code
+        if 200 <= code < 400:
+            rec.update({"class": "ok", "status": code, "reason": ""})
+        elif code in (404, 410):
+            rec.update({"class": "dead", "status": code, "reason": f"HTTP {code}"})
+        elif code in (401, 402):
+            # Auth/paywall: the resource exists, we just can't see it.
+            rec.update({"class": "restricted", "status": code, "reason": f"HTTP {code}"})
+        elif code == 405:
+            # Method not allowed — server alive, page probably moved.
+            rec.update({"class": "moved-suspect", "status": code, "reason": "HTTP 405"})
+        else:
+            rec.update({"class": "suspect", "status": code, "reason": f"HTTP {code}"})
+        return rec
+
+    def _update_health(self, link: dict, url: str, cls: str,
+                       status, reason: str, final_url: str = ""):
+        """Record/refresh a link's health record (streak logic)."""
+        if not HEALTH_TRACKING:
+            return
+        lid = f"ld-{link.get('id')}"
+        prev = self._health.get(lid, {})
+        streak = prev.get("fail_streak", 0)
+        if cls == "ok":
+            streak = 0
+        else:
+            streak = streak + 1
+        rec = {
+            "class": cls,
+            "status": status,
+            "reason": reason,
+            "last_checked": datetime.now(timezone.utc).isoformat(),
+            "fail_streak": streak,
+        }
+        # Track stable redirect target (only when class is redirected)
+        if cls == "redirected" and final_url:
+            prev_target = prev.get("final_url")
+            rec["final_url"] = final_url
+            rec["redirect_streak"] = 1 if prev_target != final_url else prev.get("redirect_streak", 0) + 1
+        self._health[lid] = rec
+
+    def _prune_health(self, valid_ids: set):
+        """Drop health records for links no longer in Linkding."""
+        if not HEALTH_TRACKING:
+            return
+        stale = [k for k in self._health if k not in valid_ids]
+        for k in stale:
+            del self._health[k]
+        if stale:
+            logger.debug(f"Pruned {len(stale)} stale health records")
+
+    def get_link_health(self, cls: str = None) -> list:
+        """Return health records, optionally filtered by class (None = all)."""
+        rows = []
+        for lid, rec in self._health.items():
+            if cls and rec.get("class") != cls:
+                continue
+            rows.append({"id": lid, **rec})
+        # Worst first: highest fail streak, then most recent check
+        rows.sort(key=lambda r: r.get("last_checked", ""), reverse=True)
+        rows.sort(key=lambda r: (r.get("fail_streak") or 0), reverse=True)
+        return rows
+
+    def get_health_summary(self) -> dict:
+        """Aggregate health counts for /api/status."""
+        counts = {}
+        for rec in self._health.values():
+            c = rec.get("class", "unknown")
+            counts[c] = counts.get(c, 0) + 1
+        return {
+            "tracked": len(self._health),
+            "by_class": counts,
+        }
+
+    def _internal_host(self, url: str) -> str:
+        """Return the host if it's a private/reserved IP literal (unreachable
+        by design from outside the LAN), else ''."""
         try:
-            content = trafilatura.fetch_url(url)
-            if not content:
-                return {"title": "", "text": ""}
-            text = trafilatura.extract(
-                content,
-                include_comments=False,
-                include_tables=True,
-                include_links=False,
-                favor_precision=True
+            host = (urlparse(url).hostname or "").strip("[]")
+            if host:
+                ip = ipaddress.ip_address(host)
+                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                    return host
+        except (ValueError, Exception):
+            pass
+        return ""
+
+    def _fetch_and_extract(self, url: str, link: dict) -> dict:
+        """Fetch a page (recording health), then extract text with trafilatura.
+
+        Fetching via our own session (browser-like UA, bounded timeout)
+        gives us the HTTP status + final URL that trafilatura.fetch_url
+        hides — needed for dead/moved classification.
+        """
+        # Intranet/private-IP links: skip the network call entirely —
+        # they can't be reached from here, and hammering them is wasteful.
+        internal = self._internal_host(url)
+        if internal:
+            self._update_health(link, url, "unreachable-internal", None,
+                                f"private/reserved address {internal}")
+            return {"title": "", "text": "", "final_url": url,
+                    "health": {"class": "unreachable-internal", "status": None,
+                               "reason": f"private/reserved address {internal}"}}
+
+        rec = None
+        html = None
+        final_url = url
+        try:
+            resp = self._fetch_session.get(
+                url, headers={"User-Agent": FETCH_USER_AGENT},
+                timeout=FETCH_TIMEOUT, allow_redirects=True,
             )
-            return {"title": "", "text": text or ""}
+            final_url = str(resp.url) if resp.url else url
+            rec = self._classify_fetch(url, resp, None)
+            if 200 <= resp.status_code < 400:
+                ctype = resp.headers.get("Content-Type", "")
+                if "text/html" in ctype or not ctype:
+                    html = resp.text
+                # non-HTML 2xx (PDF etc.): no extraction possible
+        except Exception as e:
+            rec = self._classify_fetch(url, None, e)
+
+        # Redirected: final host/path differs from the bookmark URL
+        if rec and rec["class"] == "ok" and final_url != url:
+            a, b = urlparse(url), urlparse(final_url)
+            if (a.netloc != b.netloc) or (a.path != b.path):
+                rec = {**rec, "class": "redirected"}
+
+        # Update health store
+        self._update_health(
+            link, url,
+            rec.get("class", "suspect") if rec else "suspect",
+            rec.get("status") if rec else None,
+            rec.get("reason", "") if rec else "no record",
+            final_url=final_url,
+        )
+
+        # Extract content from the fetched HTML. (Non-HTML 2xx such as PDFs
+        # are not extracted — acceptable for the link corpus; it also avoids
+        # a second network fetch that would double the load on slow links.)
+        text = ""
+        try:
+            if html:
+                text = trafilatura.extract(
+                    html,
+                    include_comments=False,
+                    include_tables=True,
+                    include_links=False,
+                    favor_precision=True,
+                ) or ""
+        except Exception as e:
+            logger.debug(f"Extraction failed for {url}: {e}")
+
+        return {
+            "title": "",
+            "text": text,
+            "final_url": final_url,
+            "health": rec or {"class": "suspect", "status": None, "reason": "no record"},
+        }
+
+    def _extract_page_content(self, url: str, link: dict = None) -> dict:
+        """Fetch and extract text content from a URL, recording link health."""
+        try:
+            return self._fetch_and_extract(url, link or {"id": None, "url": url})
         except Exception as e:
             logger.warning(f"Failed to extract content from {url}: {e}")
-            return {"title": "", "text": ""}
+            if link is not None:
+                self._update_health(link, url, "suspect", None, f"fetch error: {type(e).__name__}")
+            return {"title": "", "text": "", "final_url": url,
+                    "health": {"class": "suspect", "status": None, "reason": str(e)}}
 
     def _build_embedding_text(self, link: dict, page_content: dict) -> str:
         """Build metadata text to embed from link title/tags/description/notes."""
@@ -431,8 +659,8 @@ class Indexer:
                 except Exception:
                     pass
 
-            # Extract page content
-            page_content = self._extract_page_content(url)
+            # Extract page content (records link health)
+            page_content = self._extract_page_content(url, link)
 
             # Build separate text for metadata and content embeddings
             meta_text = self._build_embedding_text(link, page_content)
@@ -477,7 +705,9 @@ class Indexer:
 
         self._last_index_time = datetime.now(timezone.utc).isoformat()
         self._total_indexed = len(links)
+        self._prune_health(expected_ids)
         self._save_status()
+        self._save_health()
         logger.info(f"Index complete: {self._total_indexed} links stored")
         return self._total_indexed
 
@@ -547,7 +777,7 @@ class Indexer:
                 except Exception:
                     pass
 
-            page_content = self._extract_page_content(url)
+            page_content = self._extract_page_content(url, link)
 
             meta_text = self._build_embedding_text(link, page_content)
             content_text = self._build_content_text(link, page_content)
@@ -587,7 +817,9 @@ class Indexer:
             time.sleep(0.1)
 
         self._last_diff_index_time = datetime.now(timezone.utc).isoformat()
+        self._prune_health(expected_ids)
         self._save_status()
+        self._save_health()
         logger.info(f"Diff index complete: {added} added, {removed} removed, {unchanged} unchanged")
         return {"added": added, "removed": removed, "unchanged": unchanged}
 
