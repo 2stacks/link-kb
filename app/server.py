@@ -50,7 +50,11 @@ def get_indexer():
 
 def _run_full_index():
     """Run full index in background thread."""
-    global _full_indexing
+    global _full_indexing, _full_progress
+    # Defense in depth: guarantee a fresh progress state for this run no
+    # matter which code path (manual trigger, scheduler) started the thread.
+    with index_lock:
+        _full_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
     try:
         ix = get_indexer()
         def on_progress(i, total, url):
@@ -83,7 +87,10 @@ def _run_full_index():
 
 def _run_diff_index():
     """Run diff index in background thread."""
-    global _diff_indexing
+    global _diff_indexing, _diff_progress
+    # Defense in depth — see _run_full_index.
+    with index_lock:
+        _diff_progress = {"total": 0, "processed": 0, "started_at": None, "done": False}
     try:
         ix = get_indexer()
         def on_progress(i, total, url):
@@ -152,7 +159,7 @@ def search():
 @app.route("/api/full-index", methods=["POST"])
 def trigger_full_index():
     """Start a full re-index in the background."""
-    global _full_indexing
+    global _full_indexing, _full_progress
     with index_lock:
         if _full_indexing:
             return jsonify({
@@ -172,7 +179,7 @@ def trigger_full_index():
 @app.route("/api/diff-index", methods=["POST"])
 def trigger_diff_index():
     """Start a diff re-index in the background."""
-    global _diff_indexing
+    global _diff_indexing, _diff_progress
     with index_lock:
         if _diff_indexing:
             return jsonify({
@@ -243,7 +250,7 @@ if __name__ == "__main__":
 
 def _schedule_full_index():
     """Start full indexer on schedule."""
-    global _full_indexing
+    global _full_indexing, _full_progress
     with index_lock:
         if _full_indexing:
             return
@@ -258,7 +265,7 @@ def _schedule_full_index():
 
 def _schedule_diff_index():
     """Start diff indexer on schedule."""
-    global _diff_indexing
+    global _diff_indexing, _diff_progress
     with index_lock:
         if _diff_indexing or _full_indexing:
             return
