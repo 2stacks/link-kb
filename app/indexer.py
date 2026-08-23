@@ -757,7 +757,11 @@ class Indexer:
         # Remove stale entries (deleted in Linkding)
         for col_name, col in [("links_meta", self.meta_collection),
                               ("links_content", self.content_collection)]:
-            all_ids = col.get(["ids"])["ids"]
+            # chromadb 1.x: first positional arg of .get() is an `ids` FILTER,
+            # not an include list — col.get(["ids"]) silently returned [] and
+            # this cleanup deleted nothing. Fixed in v1.0.19; until then stale
+            # entries only ever died via diff_index.
+            all_ids = col.get(include=["metadatas"])["ids"]
             stale = [did for did in all_ids if did not in expected_ids]
             if stale:
                 col.delete(ids=stale)
