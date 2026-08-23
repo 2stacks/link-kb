@@ -66,7 +66,7 @@ cp .env.example .env
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python app.py
+python -m app.server
 
 # 3. Run in Docker
 docker compose up -d --build
@@ -81,7 +81,7 @@ curl -X POST http://localhost:5000/api/full-index
 |---|---|---|
 | `LINKDING_URL` | Linkding base URL | `https://linkding.2stacks.net` |
 | `LINKDING_API_KEY` | Linkding API token | (required) |
-| | `EMBEDDING_URL` | Embedding service base URL | `http://localhost:8080` |
+| `EMBEDDING_URL` | Embedding service base URL | `http://localhost:8080` |
 | `EMBEDDING_MODEL` | Embedding model ID | `nomic-embed-text-v1.5` |
 | `DB_PATH` | ChromaDB directory | `/data/link-kb` |
 | `EMBEDDING_TIMEOUT` | Per-embed-request timeout (s) | `120` |
@@ -89,8 +89,14 @@ curl -X POST http://localhost:5000/api/full-index
 | `EMBEDDING_READY_INTERVAL` | Probe interval for the cold-start wait (s) | `5` |
 | `EMBED_PROBE_TIMEOUT` | Mid-run liveness-probe timeout (s, no retries) | `10` |
 | `EMBED_BREAKER_THRESHOLD` | Consecutive bad probes before the run waits for endpoint recovery | `3` |
+| `EMBED_RETRY_BACKOFF` | Retry backoff factor for the embedding session (exponential, s) | `2` |
+| `FULL_INDEX_INTERVAL_HOURS` | Scheduled full re-index interval (h; `0` = disabled, manual only) | `0` |
+| `DIFF_INDEX_INTERVAL_HOURS` | Scheduled diff re-index interval (h; `0` = disabled) | `24` |
 | `HEALTH_TRACKING` | Track link health during indexing (`1`/`0`) | `1` |
 | `FETCH_TIMEOUT` | Per-page fetch timeout (s) | `15` |
+| `LOG_LEVEL` | Python logging level | `INFO` |
+| `PORT` | HTTP listen port | `5000` |
+| `FLASK_DEBUG` | Run Flask in debug mode (`true`/`false`; Docker uses gunicorn, not this) | `false` |
 
 ## Link health
 
