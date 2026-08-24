@@ -9,7 +9,6 @@ instance/
 .DS_Store
 
 # Test artifacts
-test_*.py
 find_*.py
 
 # Planning docs (local notes)
