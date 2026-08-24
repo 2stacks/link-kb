@@ -5,3 +5,4 @@ trafilatura==2.*
 python-dotenv==1.0.*
 apscheduler==3.11.*
 gunicorn==23.0.*
+pytest==8.*

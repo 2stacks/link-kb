@@ -42,11 +42,11 @@ release that touches configuration, API, or behavior:
 - Suite lives in `tests/` (pytest style, all offline — Linkding fetches,
   page extraction, and embedding calls are monkeypatched; never add a test
   that needs network or a real model endpoint).
-- Run with `python tests/run_all.py` (works with or without pytest — it's
-  the standard runner for this repo; the shipped image has no pytest).
-  With pytest installed, `python -m pytest tests/ -v` works too.
+- Run with `python -m pytest tests/ -v` (pytest ships in the image and the
+  venv). `python tests/run_all.py` works as a fallback where pytest is
+  unavailable.
 - Run against the shipped image too, since the image pins its own dependency
-  versions: `docker run --rm --entrypoint python ghcr.io/2stacks/link-kb:latest /app/tests/run_all.py`
+  versions: `docker run --rm --entrypoint python ghcr.io/2stacks/link-kb:latest -m pytest /app/tests -v`
 - **Every bug fix ships with a regression test that fails on the pre-fix
   commit and passes after.** Verify both directions before releasing.
 
