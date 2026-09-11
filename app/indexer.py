@@ -80,6 +80,9 @@ AUTO_ARCHIVE = os.getenv("LINK_HEALTH_AUTO_ARCHIVE", "false").lower() == "true"
 DEAD_STRIKES = int(os.getenv("CLEANUP_DEAD_STRIKES", "2"))
 # stable redirect target streak at/above this → update the bookmark URL
 REDIRECT_STREAK = int(os.getenv("CLEANUP_REDIRECT_STREAK", "2"))
+# When true, a full index run reconciles @HEALTH_HTTP_* bookmark tags with the
+# fresh health store (add on 4xx/5xx, strip on recovery/unknown). Off by default.
+TAG_SYNC = os.getenv("LINK_HEALTH_TAG_SYNC", "false").lower() == "true"
 # Query params that must never be written back as a bookmark URL
 # (tracking / session / analytics junk from redirect targets).
 _TRACKING_PARAMS = frozenset({
@@ -121,6 +124,7 @@ class Indexer:
         self._embed_failed = []
         self._embed_down_since = None  # ISO ts while the breaker is waiting on recovery
         self._health = {}
+        self._last_tag_sync = None
         self._load_status()
         self._load_health()
         # Persistent session with connection pooling to avoid CLOSE-WAIT buildup on llama-swap.
@@ -258,6 +262,8 @@ class Indexer:
             "embed_endpoint_state": self._probe_endpoint_cached(),
             "embed_down_since": self._embed_down_since,
             "link_health": self.get_health_summary(),
+            "tag_sync": self._last_tag_sync,
+            "tag_sync_enabled": TAG_SYNC,
         }
 
     def _probe_endpoint_cached(self, max_age_s: float = 5.0) -> str:
@@ -760,6 +766,76 @@ class Indexer:
             time.sleep(0.05)
         return {"applied": applied, "failed": failed, "results": results}
 
+    def _sync_health_tags(self) -> dict:
+        """Reconcile @HEALTH_HTTP_* bookmark tags with the fresh health store.
+
+        Runs at the end of a full index (only — diff runs don't refresh every
+        link, so they'd strip tags on un-rechecked links). Gate: TAG_SYNC.
+
+        Per live tracked bookmark:
+          - status is 4xx/5xx  -> add @HEALTH_HTTP_<status> if missing
+          - status is 2xx/3xx or None -> strip any @HEALTH_HTTP_* tags
+          - tag set already matches -> no write (no noise)
+        Only @HEALTH_HTTP_* tags are touched; other tags are preserved.
+        Per-item error isolation: one Linkding failure is recorded and the
+        run continues. JSON body (Linkding rejects form-encoded with 415).
+        """
+        if not TAG_SYNC:
+            return {"enabled": False, "added": 0, "removed": 0, "unchanged": 0,
+                    "failed": 0, "items": []}
+        links = self._fetch_linkding_links()
+        added = removed = unchanged = failed = 0
+        items = []
+        for link in links:
+            if link.get("is_archived"):
+                continue
+            rec = self._health.get(f"ld-{link.get('id')}")
+            if rec is None:
+                continue
+            code = rec.get("status")
+            tags = list(link.get("tag_names") or [])
+            health_tags = [t for t in tags if t.startswith("@HEALTH_HTTP_")]
+            if isinstance(code, int) and code >= 400:
+                want = [f"@HEALTH_HTTP_{code}"]
+            else:
+                want = []  # 2xx/3xx or unknown -> no health tag
+            if health_tags == want:
+                unchanged += 1
+                continue
+            new_tags = [t for t in tags if not t.startswith("@HEALTH_HTTP_")] + want
+            bm_id = link.get("id")
+            url = f"{LINKDING_URL}/api/bookmarks/{bm_id}/"
+            item = {"id": f"ld-{bm_id}", "bm_id": bm_id, "url": link.get("url"),
+                    "status": code, "from": health_tags, "to": want}
+            try:
+                resp = self._session.patch(url, headers=self.headers,
+                                           json={"tag_names": new_tags}, timeout=30)
+                if resp.status_code in (200, 202):
+                    if want:
+                        added += 1
+                    else:
+                        removed += 1
+                    item["ok"] = True
+                    item["status_code"] = resp.status_code
+                else:
+                    failed += 1
+                    item["ok"] = False
+                    item["status_code"] = resp.status_code
+                    item["error"] = resp.text[:200]
+            except Exception as e:
+                failed += 1
+                item["ok"] = False
+                item["error"] = f"{type(e).__name__}: {e}"
+            items.append(item)
+            time.sleep(0.05)
+        report = {"enabled": True, "added": added, "removed": removed,
+                  "unchanged": unchanged, "failed": failed, "items": items,
+                  "at": datetime.now(timezone.utc).isoformat()}
+        self._last_tag_sync = report
+        logger.info(f"Tag sync: +{added} added, -{removed} removed, "
+                    f"{unchanged} unchanged, {failed} failed")
+        return report
+
     def _internal_host(self, url: str) -> str:
         """Return the host if it's a private/reserved IP literal (unreachable
         by design from outside the LAN), else ''."""
@@ -1027,6 +1103,15 @@ class Indexer:
         self._prune_health(expected_ids)
         self._save_status()
         self._save_health()
+        # Reconcile @HEALTH_HTTP_* tags with the freshly-refreshed health store
+        # (full index only — diff runs don't recheck every link, so they must
+        # not strip tags). Gated by LINK_HEALTH_TAG_SYNC; a failure here is a
+        # logged warning, never fatal to the index itself.
+        if TAG_SYNC:
+            try:
+                self._sync_health_tags()
+            except Exception as e:
+                logger.warning(f"Tag sync failed (index unaffected): {e}")
         logger.info(f"Index complete: {self._total_indexed} links stored")
         return self._total_indexed
 
