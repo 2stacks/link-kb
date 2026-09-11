@@ -30,6 +30,10 @@ BM = {
 }
 BM[107]["is_archived"] = True
 BM[108]["is_archived"] = True
+# 110: a LIVE bookmark already sitting at a redirect destination
+BM[110] = {"id": 110, "url": "https://b.example/moved", "description": "", "tag_names": []}
+# 111: a stale bookmark whose redirect target is the already-bookmarked 110
+BM[111] = {"id": 111, "url": "https://a.example/old-moved", "description": "", "tag_names": []}
 
 HEALTH = {
     "ld-101": {"class": "dead", "status": 404, "reason": "HTTP 404", "fail_streak": 3},
@@ -46,6 +50,10 @@ HEALTH = {
                "final_url": "https://b.example/x", "redirect_streak": 4},
     "ld-109": {"class": "redirected", "status": 200, "reason": "",
                "final_url": "https://b.example/desc", "redirect_streak": 2},
+    # 111: redirect target is ALREADY bookmarked (110) → must be skipped,
+    # never proposed as an update (would create a duplicate URL)
+    "ld-111": {"class": "redirected", "status": 200, "reason": "",
+               "final_url": "https://b.example/moved", "redirect_streak": 3},
 }
 
 
@@ -86,6 +94,21 @@ def test_sanitizer_strips_tracking_keeps_benign():
     assert ix._sanitize_final_url("https://x.example/a?utm_source=y&ref=z") == \
         "https://x.example/a"
     assert ix._sanitize_final_url("https://x.example/a?keep=1") == "https://x.example/a?keep=1"
+
+
+def test_plan_skips_dup_targets_without_hiding_them():
+    # v1.0.24: a redirect whose destination is already a live bookmark must
+    # NOT be proposed as update_url (would create a duplicate URL), but it is
+    # surfaced in skipped_dup_targets — never a silent no-op.
+    ix = _ix()
+    plan = ix.get_cleanup_plan()
+    upd = _by_action(plan, "update_url")
+    assert 111 not in upd, f"dup-target leak into plan: {[p['original'] for p in plan['planned']]}"
+    assert plan["skipped_dup_count"] == 1
+    skip = plan["skipped_dup_targets"][0]
+    assert skip["bm_id"] == 111 and skip["final"] == "https://b.example/moved"
+    # the plan's 'counts' only counts actionable items
+    assert plan["counts"] == {"archive": 2, "update_url": 3}
 
 
 def test_plan_description_flag_and_scope_filter():

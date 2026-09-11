@@ -129,7 +129,7 @@ prune automatically when links are deleted in Linkding.
 | `/api/diff-index` | POST | Trigger incremental index |
 | `/api/status` | GET | Indexing stats + link-health summary |
 | `/api/link-health` | GET | Health records (param: `class` filter), worst-first |
-| `/api/check-links` | GET | Cleanup dry-run plan: what WOULD be archived / URL-updated (no writes) |
+| `/api/check-links` | GET | Cleanup dry-run plan: what WOULD be archived / URL-updated (no writes). Redirects whose target is already bookmarked are excluded from `planned` and listed in `skipped_dup_targets` (dedup candidates, never updated into duplicates) |
 | `/api/check-links` | POST | Execute cleanup (archive dead links, update moved URLs). Body `{"scope": "archive" \| "redirects" \| "all"}`. Refused with 403 unless `LINK_HEALTH_AUTO_ARCHIVE=true` |
 
 ## Deploy

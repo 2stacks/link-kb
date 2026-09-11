@@ -650,7 +650,13 @@ class Indexer:
         """
         links = self._fetch_linkding_links()
         bm_by_id = {b.get("id"): b for b in links}
+        # Live (non-archived) bookmark URLs — used to detect redirect targets
+        # that are ALREADY bookmarked. Updating the old bookmark to that URL
+        # would create a duplicate; the destination is covered, so the old
+        # bookmark is a dedup candidate instead (see skipped_dup_targets).
+        live_urls = {b.get("url", "").lower() for b in links if not b.get("is_archived")}
         plan = []
+        skipped_dup = []
         for lid, rec in self._health.items():
             try:
                 bm_id = int(lid.split("-")[1])
@@ -673,6 +679,17 @@ class Indexer:
                 if rec.get("redirect_streak", 0) >= REDIRECT_STREAK and rec.get("final_url"):
                     final = self._sanitize_final_url(rec["final_url"])
                     if final and final != cur:
+                        if final.lower() in live_urls:
+                            # Destination is already bookmarked — updating
+                            # would create a duplicate URL. Surface it (never
+                            # a silent no-op) so the user can dedup by hand.
+                            skipped_dup.append({
+                                "id": lid, "bm_id": bm_id, "action": "skip_dup_target",
+                                "original": cur, "final": final,
+                                "streak": rec.get("redirect_streak", 0),
+                                "reason": "target already bookmarked",
+                            })
+                            continue
                         plan.append({
                             "id": lid, "bm_id": bm_id, "action": "update_url",
                             "original": cur, "final": final,
@@ -689,6 +706,8 @@ class Indexer:
             counts[p["action"]] = counts.get(p["action"], 0) + 1
         return {
             "planned": plan,
+            "skipped_dup_targets": skipped_dup,
+            "skipped_dup_count": len(skipped_dup),
             "counts": counts,
             "scope": scope or "all",
             "thresholds": {"dead_strikes": DEAD_STRIKES, "redirect_streak": REDIRECT_STREAK},
