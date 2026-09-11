@@ -19,7 +19,7 @@ import time
 import logging
 import requests
 from urllib3.util import Retry
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qsl, urlencode
 import chromadb
 import trafilatura
 from datetime import datetime, timezone
@@ -71,6 +71,22 @@ EMBED_BREAKER_THRESHOLD = int(os.getenv("EMBED_BREAKER_THRESHOLD", "3"))
 # Persist link_health.json every N links during a run (so an aborted run
 # still yields its dead/redirected report for the portion that completed).
 HEALTH_SAVE_EVERY = 50
+
+# --- Phase 3: dead-link cleanup write-back (archive / URL update) ---
+# Opt-in gate: the dry-run plan (GET) is always available, but the write-back
+# (POST) is REFUSED unless this is "true". Archive-only — never delete.
+AUTO_ARCHIVE = os.getenv("LINK_HEALTH_AUTO_ARCHIVE", "false").lower() == "true"
+# dead fail_streak at/above this → archive (a single 410 counts immediately)
+DEAD_STRIKES = int(os.getenv("CLEANUP_DEAD_STRIKES", "2"))
+# stable redirect target streak at/above this → update the bookmark URL
+REDIRECT_STREAK = int(os.getenv("CLEANUP_REDIRECT_STREAK", "2"))
+# Query params that must never be written back as a bookmark URL
+# (tracking / session / analytics junk from redirect targets).
+_TRACKING_PARAMS = frozenset({
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "sc_cid", "hl", "gclid", "fbclid", "ref", "referrer",
+    "mc_cid", "mc_eid", "s_cid",
+})
 
 
 class EmbeddingError(Exception):
@@ -597,6 +613,133 @@ class Indexer:
             "tracked": len(self._health),
             "by_class": counts,
         }
+
+    def _sanitize_final_url(self, url: str) -> str:
+        """Strip tracking/session/analytics query params from a redirect
+        target so junk (utm_*, gclid, session ids, …) never becomes a
+        bookmark URL. Non-query junk (e.g. `;jsessionid=…` path segments)
+        is self-protected: a random per-session value can't reach a stable
+        redirect_streak, so such targets are never written back.
+        """
+        if not url:
+            return url
+        p = urlparse(url)
+        if not p.query:
+            return url
+        parsed = parse_qsl(p.query, keep_blank_values=True)
+        kept = [(k, v) for k, v in parsed if k.lower() not in _TRACKING_PARAMS]
+        if len(kept) == len(parsed):
+            return url
+        return p._replace(query=urlencode(kept)).geturl()
+
+    def get_cleanup_plan(self, scope: str = None) -> dict:
+        """Evaluate the Phase 3 cleanup rules against the current health store.
+
+        Returns a PLAN ONLY — it never writes to Linkding.
+        scope: 'archive' | 'redirects' | None (all) — filters which actions
+        to include.
+
+        Rules (archive-only — never delete):
+          archive    — class dead, fail_streak >= DEAD_STRIKES (or a single
+                       HTTP 410), bookmark not already archived.
+          update_url — class redirected, redirect_streak >= REDIRECT_STREAK,
+                       sanitized final_url differs from the current bookmark
+                       URL, bookmark not already archived.
+        Never touched: ok, suspect, restricted, moved-suspect,
+        unreachable-internal.
+        """
+        links = self._fetch_linkding_links()
+        bm_by_id = {b.get("id"): b for b in links}
+        plan = []
+        for lid, rec in self._health.items():
+            try:
+                bm_id = int(lid.split("-")[1])
+            except (ValueError, IndexError):
+                continue
+            bm = bm_by_id.get(bm_id)
+            if not bm or bm.get("is_archived"):
+                continue  # deleted since last check, or already handled
+            cls = rec.get("class")
+            cur = bm.get("url", "")
+            if cls == "dead":
+                if rec.get("fail_streak", 0) >= DEAD_STRIKES or rec.get("status") == 410:
+                    plan.append({
+                        "id": lid, "bm_id": bm_id, "action": "archive",
+                        "original": cur, "final": None,
+                        "streak": rec.get("fail_streak", 0),
+                        "reason": f"dead ({rec.get('reason') or 'HTTP ' + str(rec.get('status'))})",
+                    })
+            elif cls == "redirected":
+                if rec.get("redirect_streak", 0) >= REDIRECT_STREAK and rec.get("final_url"):
+                    final = self._sanitize_final_url(rec["final_url"])
+                    if final and final != cur:
+                        plan.append({
+                            "id": lid, "bm_id": bm_id, "action": "update_url",
+                            "original": cur, "final": final,
+                            "streak": rec.get("redirect_streak", 0),
+                            "has_description": bool((bm.get("description") or "").strip()),
+                            "reason": "redirected",
+                        })
+        if scope in ("archive", "redirects"):
+            want = "archive" if scope == "archive" else "update_url"
+            plan = [p for p in plan if p["action"] == want]
+        plan.sort(key=lambda p: (p["action"], -p["streak"]))
+        counts = {}
+        for p in plan:
+            counts[p["action"]] = counts.get(p["action"], 0) + 1
+        return {
+            "planned": plan,
+            "counts": counts,
+            "scope": scope or "all",
+            "thresholds": {"dead_strikes": DEAD_STRIKES, "redirect_streak": REDIRECT_STREAK},
+            "auto_archive_enabled": AUTO_ARCHIVE,
+        }
+
+    def apply_cleanup(self, plan: dict, scope: str = None) -> dict:
+        """Execute a cleanup plan against Linkding via the REST API.
+
+        Per-item results; a Linkding error on one item is recorded and the
+        run continues — never fatal. The caller is responsible for the
+        LINK_HEALTH_AUTO_ARCHIVE gate (enforced in the server route).
+        """
+        if scope in ("archive", "redirects"):
+            want = "archive" if scope == "archive" else "update_url"
+            items = [p for p in plan["planned"] if p["action"] == want]
+        else:
+            items = plan["planned"]
+        results, applied, failed = [], 0, 0
+        for p in items:
+            bm_id = p["bm_id"]
+            url = f"{LINKDING_URL}/api/bookmarks/{bm_id}/"
+            if p["action"] == "archive":
+                payload = {"is_archived": True}
+            else:
+                payload = {"url": p["final"]}
+                if not p.get("has_description"):
+                    # URL changed and there's no existing note — record where
+                    # it came from without clobbering any user description.
+                    payload["description"] = f"link-kb: updated from {p['original']}"
+            item = {"id": p["id"], "bm_id": bm_id, "action": p["action"],
+                    "original": p["original"], "final": p["final"]}
+            try:
+                resp = self._session.patch(url, headers=self.headers,
+                                           json=payload, timeout=30)
+                if resp.status_code in (200, 202):
+                    item["ok"] = True
+                    item["status"] = resp.status_code
+                    applied += 1
+                else:
+                    item["ok"] = False
+                    item["status"] = resp.status_code
+                    item["error"] = resp.text[:200]
+                    failed += 1
+            except Exception as e:
+                item["ok"] = False
+                item["error"] = f"{type(e).__name__}: {e}"
+                failed += 1
+            results.append(item)
+            time.sleep(0.05)
+        return {"applied": applied, "failed": failed, "results": results}
 
     def _internal_host(self, url: str) -> str:
         """Return the host if it's a private/reserved IP literal (unreachable

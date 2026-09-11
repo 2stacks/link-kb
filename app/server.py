@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from .indexer import Indexer, EmbeddingError, IndexAbortedError
+from .indexer import Indexer, EmbeddingError, IndexAbortedError, AUTO_ARCHIVE
 
 app = Flask(__name__, template_folder="../templates")
 
@@ -238,6 +238,45 @@ def link_health():
         "class": cls,
         "records": rows,
     })
+
+
+@app.route("/api/check-links", methods=["GET", "POST"])
+def check_links():
+    """Phase 3 dead-link cleanup: plan (GET) and execute (POST).
+
+    GET — DRY RUN, always available. Evaluates the rules against the
+    current health store and returns what WOULD happen (no Linkding
+    writes):
+      {planned: [{id, bm_id, action: archive|update_url, original, final,
+                 streak, reason, ...}], counts, scope, thresholds}
+
+    POST — writes to Linkding (archive / URL update) — but ONLY if
+    LINK_HEALTH_AUTO_ARCHIVE=true. Otherwise returns 403 with the
+    would-be plan so the caller can see exactly what was refused.
+    Body (optional JSON): {"scope": "archive" | "redirects" | "all"}
+      archive   — dead links only (is_archived=true)
+      redirects — URL updates only
+      all       — both (default)
+    Per-item results are returned; a Linkding error on one item is
+    reported and the run continues.
+    """
+    scope = (request.get_json(silent=True) or {}).get("scope") or None
+    if scope not in ("archive", "redirects", "all", None):
+        return jsonify({"error": "scope must be 'archive', 'redirects', or 'all'"}), 400
+    ix = get_indexer()
+    plan = ix.get_cleanup_plan(scope=scope)
+    if request.method == "GET":
+        plan["dry_run"] = True
+        return jsonify(plan)
+    # POST: gated write-back
+    if not AUTO_ARCHIVE:
+        plan["dry_run"] = True
+        plan["refused"] = ("LINK_HEALTH_AUTO_ARCHIVE is not enabled — set it to "
+                           "true to allow write-back; nothing was written.")
+        return jsonify(plan), 403
+    result = ix.apply_cleanup(plan, scope=scope)
+    return jsonify({**plan, "dry_run": False, "applied": result["applied"],
+                    "failed": result["failed"], "results": result["results"]})
 
 
 if __name__ == "__main__":

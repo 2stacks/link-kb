@@ -94,6 +94,9 @@ curl -X POST http://localhost:5000/api/full-index
 | `DIFF_INDEX_INTERVAL_HOURS` | Scheduled diff re-index interval (h; `0` = disabled) | `24` |
 | `HEALTH_TRACKING` | Track link health during indexing (`1`/`0`) | `1` |
 | `FETCH_TIMEOUT` | Per-page fetch timeout (s) | `15` |
+| `LINK_HEALTH_AUTO_ARCHIVE` | Allow `/api/check-links` POST write-back to Linkding (`true`/`false`; archive + URL update only, never delete; GET dry-run works regardless) | `false` |
+| `CLEANUP_DEAD_STRIKES` | `dead` fail-streak required before a link is archived (a single HTTP 410 archives immediately) | `2` |
+| `CLEANUP_REDIRECT_STREAK` | Stable `redirected` streak required before the bookmark URL is updated | `2` |
 | `LOG_LEVEL` | Python logging level | `INFO` |
 | `PORT` | HTTP listen port | `5000` |
 | `FLASK_DEBUG` | Run Flask in debug mode (`true`/`false`; Docker uses gunicorn, not this) | `false` |
@@ -126,6 +129,8 @@ prune automatically when links are deleted in Linkding.
 | `/api/diff-index` | POST | Trigger incremental index |
 | `/api/status` | GET | Indexing stats + link-health summary |
 | `/api/link-health` | GET | Health records (param: `class` filter), worst-first |
+| `/api/check-links` | GET | Cleanup dry-run plan: what WOULD be archived / URL-updated (no writes) |
+| `/api/check-links` | POST | Execute cleanup (archive dead links, update moved URLs). Body `{"scope": "archive" \| "redirects" \| "all"}`. Refused with 403 unless `LINK_HEALTH_AUTO_ARCHIVE=true` |
 
 ## Deploy
 
