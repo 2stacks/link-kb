@@ -17,7 +17,16 @@ Release = a version bump. In this order:
    `docker run --rm --entrypoint python ghcr.io/2stacks/link-kb:vX.Y.Z -c "..."`
    (the ENTRYPOINT is gunicorn; always pass `--entrypoint`).
 6. Push the image (`latest` + version tag), then `git push origin main --tags`.
-7. Docs-only change: steps 1-3 + git push only; no image rebuild.
+7. Docs-only change: **no version bump, no tag** — commit and push the doc
+   edit as-is (it rides along in the next release's history). If the docs
+   change is substantial enough to warrant its own bump, propose that in a
+   plan first and get approval.
+8. **Any `.version` bump requires an approved plan first** — never bump
+   mid-flow while a change is still being discussed. While a code change is
+   in discussion, reserve the next code-release number for it; do not
+   consume numbers for interim docs commits (lesson: v1.0.25/v1.0.26 were
+   burned on two docs-only bumps while the tag-sync code change was still
+   being scoped — user pushed back 2026-09-11).
 
 The remote deployment is pull-based by the user — agents never deploy.
 
