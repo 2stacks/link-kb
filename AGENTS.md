@@ -73,6 +73,14 @@ release that touches configuration, API, or behavior:
   target system, not just the health record. Skip is fine, but it must be
   visible: v1.0.24 surfaces these in `skipped_dup_targets` rather than
   dropping them (same silent-no-op rule as above).
+- **Linkding `PATCH /api/bookmarks/<id>/` requires a JSON body.** A
+  form-encoded body is answered with `415 Unsupported Media Type` — no
+  mutation, no obvious error if you don't check the status code. Send
+  `Content-Type: application/json` (e.g. `requests.patch(...,
+  json={...})`) and assert 200/202 on every write. (2026-09-11: a stale-tag
+  strip failed 159/159 this way; caught only because the script checked
+  status codes. The AGENTS.md "silent no-ops" rule applies to any
+  write-back script, not just the server.)
 
 ## Known limitations (not bugs)
 
