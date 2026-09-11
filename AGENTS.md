@@ -65,6 +65,14 @@ release that touches configuration, API, or behavior:
 - **Silent no-ops are the dangerous class.** Both bugs above failed without
   any error or log line. When writing cleanup/delete logic that depends on a
   list of ids, assert the list is non-trivial (or log its length) in dev.
+- **Write-back plans must account for the destination, not just the source.**
+  Phase 3's first redirect pass (v1.0.23) proposed `update_url` for 55 links
+  whose redirect target was *already bookmarked* — executing would have
+  created 55 duplicate URLs (the exact thing manual dedup removes). A
+  mutation rule is only safe when it checks the *destination* state in the
+  target system, not just the health record. Skip is fine, but it must be
+  visible: v1.0.24 surfaces these in `skipped_dup_targets` rather than
+  dropping them (same silent-no-op rule as above).
 
 ## Known limitations (not bugs)
 
