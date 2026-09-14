@@ -99,3 +99,8 @@ release that touches configuration, API, or behavior:
 - After a completed full index, the `Links:` count in the UI should equal
   Linkding's API count. If it doesn't, suspect the bookmark fetch, not the
   cleanup.
+- `@HEALTH_HTTP_*` bookmark tags are a static snapshot while the health
+  store refreshes every index — the two drift over time. With
+  `LINK_HEALTH_TAG_SYNC=true` (v1.0.27, default off) tags are reconciled at
+  the end of each full index; with it off, tag accuracy is only as fresh as
+  the last manual or sync pass.
