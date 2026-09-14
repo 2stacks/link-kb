@@ -1,10 +1,11 @@
-# Add this to your existing Caddyfile on the linkding host
-# to serve link-kb behind the same reverse proxy.
+# Caddyfile for the production deploy (mounted by docker-compose.yml).
+# Replace the placeholder domain below with your own. For local testing
+# without a real domain, point the name at 127.0.0.1 in /etc/hosts.
 
-linkkb.2stacks.net {
-    reverse_proxy link-kb:5000
-    encode gzip
-    log {
-        output file /var/log/caddy/link-kb.access.log
-    }
+kb.example.com {
+	reverse_proxy link-kb:5000
+	encode gzip
+	log {
+		output stdout
+	}
 }

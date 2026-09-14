@@ -1,0 +1,58 @@
+# Production deployment: link-kb behind Caddy (reverse proxy + TLS).
+# One command from this directory:
+#   docker compose up -d --build
+# Then:
+#   curl -X POST http://<your-domain>/api/full-index
+#
+# Adjust the domain in Caddyfile.example to your own (see that file).
+# Adjust the embedding URL in ../.env to match your production service.
+
+services:
+  link-kb:
+    build: ..
+    restart: always
+    # Do NOT expose port publicly — Caddy is the only public entry point
+    expose:
+      - "5000"
+    env_file:
+      - ../.env
+    volumes:
+      - link-kb-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/status')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - linkkb
+
+  caddy:
+    image: caddy:2
+    restart: always
+    depends_on:
+      link-kb:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile.example:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - linkkb
+
+volumes:
+  link-kb-data:
+    driver: local
+  caddy-data:
+    driver: local
+  caddy-config:
+    driver: local
+
+networks:
+  linkkb:
+    driver: bridge

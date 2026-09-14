@@ -135,9 +135,26 @@ prune automatically when links are deleted in Linkding.
 
 ## Deploy
 
+### Local / direct (port exposed)
+
 1. Update `.env` with your embedding service URL and Linkding API credentials
 2. `docker compose up -d --build`
 3. Trigger initial index: `curl -X POST http://localhost:5000/api/full-index`
+
+### Production (behind Caddy, TLS)
+
+The `deploy/` folder is a self-contained Caddy + link-kb stack on a shared
+named network — Caddy is the only public entry point (80/443); link-kb
+itself exposes no port.
+
+1. Update `.env` (embedding URL, Linkding credentials)
+2. Set your domain in `deploy/Caddyfile.example`
+3. From `deploy/`: `docker compose up -d --build`
+4. Trigger initial index:
+   `curl -X POST https://<your-domain>/api/full-index`
+
+Any reverse proxy works the same way: it must reach link-kb's port 5000 over
+a shared network (Caddy in `deploy/` does this via the `linkkb` network).
 
 ## Stack
 
