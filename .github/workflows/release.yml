@@ -31,11 +31,17 @@ jobs:
       id-token: write   # cosign keyless signing (tags only)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # don't leave the job token in .git/config
 
       - name: Version
         id: v
         run: |
           file_version=$(tr -d '[:space:]' < .version)
+          # .version comes from the commit (a PR can change it): accept only X.Y.Z
+          # before it reaches any output, tag or command line.
+          [[ "$file_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::.version must be X.Y.Z"; exit 1; }
           echo "version=$file_version" >> "$GITHUB_OUTPUT"
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             [ "$GITHUB_REF_NAME" = "v$file_version" ] || {
@@ -65,8 +71,10 @@ jobs:
             org.opencontainers.image.version=v${{ steps.v.outputs.version }}
 
       - name: The image contains this commit's code
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
         run: |
-          ref="${IMAGE}:v${{ steps.v.outputs.version }}"
+          ref="${IMAGE}:v${VERSION}"
           local_sums=$(find app templates tests requirements.txt -type f ! -name '*.pyc' | sort | xargs sha256sum)
           image_sums=$(docker run --rm --entrypoint sh -w /app "$ref" -c \
             "find app templates tests requirements.txt -type f ! -name '*.pyc' | sort | xargs sha256sum")
@@ -74,7 +82,9 @@ jobs:
           echo "app/, templates/, tests/ and requirements.txt match the commit"
 
       - name: Test suite inside the image
-        run: docker run --rm --entrypoint python "${IMAGE}:v${{ steps.v.outputs.version }}" -m pytest /app/tests -v
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: docker run --rm --entrypoint python "${IMAGE}:v${VERSION}" -m pytest /app/tests -v
 
       - name: Log in to GHCR
         if: steps.v.outputs.release == 'true'
@@ -87,10 +97,12 @@ jobs:
       - name: Push the tested image
         id: push
         if: steps.v.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
         run: |
-          docker push "${IMAGE}:v${{ steps.v.outputs.version }}"
+          docker push "${IMAGE}:v${VERSION}"
           docker push "${IMAGE}:latest"
-          digest=$(docker image inspect "${IMAGE}:v${{ steps.v.outputs.version }}" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)
+          digest=$(docker image inspect "${IMAGE}:v${VERSION}" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Pushed ${IMAGE}@$digest"
 
@@ -99,12 +111,18 @@ jobs:
 
       - name: Sign the digest (keyless)
         if: steps.v.outputs.release == 'true'
-        run: cosign sign --yes "${IMAGE}@${{ steps.push.outputs.digest }}"
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
       - name: Summary
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          RELEASE: ${{ steps.v.outputs.release }}
+          DIGEST: ${{ steps.push.outputs.digest || 'not pushed' }}
         run: |
           {
-            echo "### ${IMAGE}:v${{ steps.v.outputs.version }}"
-            echo "- Release: ${{ steps.v.outputs.release }}"
-            echo "- Digest: \`${{ steps.push.outputs.digest || 'not pushed' }}\`"
+            echo "### ${IMAGE}:v${VERSION}"
+            echo "- Release: ${RELEASE}"
+            echo "- Digest: \`${DIGEST}\`"
           } >> "$GITHUB_STEP_SUMMARY"

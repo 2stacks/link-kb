@@ -22,7 +22,9 @@ Release = a version bump. In this order:
 5. Check that the run passed (Actions → release) and note the digest from
    its summary. If it failed, nothing was pushed: fix, then move the tag
    only if the release was never published, otherwise bump to the next
-   version.
+   version. Moving or deleting a `v*` tag is blocked by the repo's tag
+   ruleset ("Release tags", since 2026-11-15): disable it in Settings →
+   Rules → Rulesets for the fix, then enable it again.
 6. Pull requests and pushes to `main` run the same build and tests without
    pushing, so a red check on a PR means the release would fail too.
 7. Docs-only change: **no version bump, no tag** — commit and push the doc
