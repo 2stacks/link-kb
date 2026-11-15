@@ -1,0 +1,110 @@
+# Builds the image and runs the test suite inside it.
+# Pull requests and pushes to main: build + test only (nothing is pushed).
+# Tag vX.Y.Z: also checks the tag matches .version, pushes the tested image as
+# ghcr.io/2stacks/link-kb:vX.Y.Z and :latest, and signs the digest with cosign
+# (keyless, GitHub OIDC). The release process is in AGENTS.md.
+name: release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/2stacks/link-kb
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write   # push to GHCR (tags only)
+      id-token: write   # cosign keyless signing (tags only)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Version
+        id: v
+        run: |
+          file_version=$(tr -d '[:space:]' < .version)
+          echo "version=$file_version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            [ "$GITHUB_REF_NAME" = "v$file_version" ] || {
+              echo "::error::tag $GITHUB_REF_NAME does not match .version ($file_version)"; exit 1; }
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo ".version $file_version, ref $GITHUB_REF_NAME"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build (loaded locally; the tested image is the one pushed)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:v${{ steps.v.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=v${{ steps.v.outputs.version }}
+
+      - name: The image contains this commit's code
+        run: |
+          ref="${IMAGE}:v${{ steps.v.outputs.version }}"
+          local_sums=$(find app templates tests requirements.txt -type f ! -name '*.pyc' | sort | xargs sha256sum)
+          image_sums=$(docker run --rm --entrypoint sh -w /app "$ref" -c \
+            "find app templates tests requirements.txt -type f ! -name '*.pyc' | sort | xargs sha256sum")
+          diff <(echo "$local_sums") <(echo "$image_sums") || { echo "::error::image content differs from the commit"; exit 1; }
+          echo "app/, templates/, tests/ and requirements.txt match the commit"
+
+      - name: Test suite inside the image
+        run: docker run --rm --entrypoint python "${IMAGE}:v${{ steps.v.outputs.version }}" -m pytest /app/tests -v
+
+      - name: Log in to GHCR
+        if: steps.v.outputs.release == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the tested image
+        id: push
+        if: steps.v.outputs.release == 'true'
+        run: |
+          docker push "${IMAGE}:v${{ steps.v.outputs.version }}"
+          docker push "${IMAGE}:latest"
+          digest=$(docker image inspect "${IMAGE}:v${{ steps.v.outputs.version }}" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${IMAGE}@$digest"
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        if: steps.v.outputs.release == 'true'
+
+      - name: Sign the digest (keyless)
+        if: steps.v.outputs.release == 'true'
+        run: cosign sign --yes "${IMAGE}@${{ steps.push.outputs.digest }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### ${IMAGE}:v${{ steps.v.outputs.version }}"
+            echo "- Release: ${{ steps.v.outputs.release }}"
+            echo "- Digest: \`${{ steps.push.outputs.digest || 'not pushed' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

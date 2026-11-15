@@ -1,0 +1,39 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Base image, Python dependencies and the release workflow's actions. Updates only reach users with the next release (AGENTS.md): merging a Renovate PR doesn't publish anything.",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "America/New_York",
+  "schedule": [
+    "before 6am on saturday"
+  ],
+  "packageRules": [
+    {
+      "description": "Base image carries a digest; digest PRs bring base-OS fixes",
+      "matchDatasources": [
+        "docker"
+      ],
+      "pinDigests": true
+    },
+    {
+      "description": "Stay on Python 3.12 until a deliberate upgrade (chromadb and the other deps must support the new version)",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "python"
+      ],
+      "allowedVersions": "<3.13"
+    },
+    {
+      "description": "Major version bumps need a tick on the Dependency Dashboard first",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}

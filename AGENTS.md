@@ -10,13 +10,21 @@ Release = a version bump. In this order:
 1. Bump `.version` (keep the trailing newline).
 2. Commit with message `vX.Y.Z - <one-line summary>`.
 3. Tag `vX.Y.Z`.
-4. Code/behavior change: `docker build -t ghcr.io/2stacks/link-kb:latest -t ghcr.io/2stacks/link-kb:vX.Y.Z .`
-5. **Verify the new code is actually inside the container BEFORE pushing.**
-   Builds are layer-cached and fast — a fast build can still be a stale one.
-   Check the changed function/line in the image, e.g.
-   `docker run --rm --entrypoint python ghcr.io/2stacks/link-kb:vX.Y.Z -c "..."`
-   (the ENTRYPOINT is gunicorn; always pass `--entrypoint`).
-6. Push the image (`latest` + version tag), then `git push origin main --tags`.
+4. `git push origin main --tags`. The tag starts the `release` workflow
+   (`.github/workflows/release.yml`), which builds the image from the tagged
+   commit, checks that `.version` matches the tag, checks that `app/`,
+   `templates/`, `tests/` and `requirements.txt` inside the image match the
+   commit (the old "is the new code really in the image" step; a stale
+   layer-cached build fails here), runs the test suite inside the image,
+   then pushes `ghcr.io/2stacks/link-kb:vX.Y.Z` and `:latest` and signs the
+   digest with cosign. Nothing is built or pushed by hand any more
+   (manual `docker build`/`docker push` until v1.0.27).
+5. Check that the run passed (Actions → release) and note the digest from
+   its summary. If it failed, nothing was pushed: fix, then move the tag
+   only if the release was never published, otherwise bump to the next
+   version.
+6. Pull requests and pushes to `main` run the same build and tests without
+   pushing, so a red check on a PR means the release would fail too.
 7. Docs-only change: **no version bump, no tag** — commit and push the doc
    edit as-is (it rides along in the next release's history). If the docs
    change is substantial enough to warrant its own bump, propose that in a
@@ -56,6 +64,7 @@ release that touches configuration, API, or behavior:
   unavailable.
 - Run against the shipped image too, since the image pins its own dependency
   versions: `docker run --rm --entrypoint python ghcr.io/2stacks/link-kb:latest -m pytest /app/tests -v`
+  CI runs exactly this on every PR, push and release tag (release workflow).
 - **Every bug fix ships with a regression test that fails on the pre-fix
   commit and passes after.** Verify both directions before releasing.
 
