@@ -4,5 +4,5 @@ chromadb==1.5.*
 trafilatura==2.*
 python-dotenv==1.0.*
 apscheduler==3.11.*
-gunicorn==23.0.*
+gunicorn==27.0.*
 pytest==8.*
