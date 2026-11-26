@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Base image, Python dependencies and the release workflow's actions. Updates only reach users with the next release (AGENTS.md): merging a Renovate PR doesn't publish anything.",
+  "description": "Base image, Python dependencies and the release workflow's actions. Updates only reach users with the next release (AGENTS.md): merging a Renovate PR doesn't publish anything. Every PR requests a review from 2stacks, which is how the owner gets mail (Dashboard edits send none); majors come as PRs too, with a warning in the body.",
   "extends": [
     "config:recommended",
     ":dependencyDashboard",
@@ -9,6 +9,9 @@
   "timezone": "America/New_York",
   "schedule": [
     "before 6am on saturday"
+  ],
+  "reviewers": [
+    "2stacks"
   ],
   "packageRules": [
     {
@@ -29,11 +32,13 @@
       "allowedVersions": "<3.13"
     },
     {
-      "description": "Major version bumps need a tick on the Dependency Dashboard first",
+      "description": "Major version bumps: a PR like any other (a review request mails the owner), with a warning in the body",
       "matchUpdateTypes": [
         "major"
       ],
-      "dependencyDashboardApproval": true
+      "prBodyNotes": [
+        "**Major version:** read the upgrade guide and every breaking change before merging; tests and the image build must pass. Don't want it? Close the PR: Renovate skips this major until a newer one appears."
+      ]
     }
   ]
 }
