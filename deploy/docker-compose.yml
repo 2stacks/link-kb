@@ -29,7 +29,7 @@ services:
       - linkkb
 
   caddy:
-    image: caddy:2
+    image: caddy:2@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
     restart: always
     depends_on:
       link-kb:
